@@ -1,0 +1,31 @@
+-- stonescriptphp-pay :: prove get_active_pricing_plan() at various as-of dates
+\set alice_tenant '''00000000-0000-0000-0000-000000000001'''
+\set bob_tenant   '''00000000-0000-0000-0000-000000000002'''
+\set carol_tenant '''00000000-0000-0000-0000-000000000003'''
+\set platform     '''testplatform'''
+
+-- Carol's trial: started 2026-02-01, 30 days -> covers up to 2026-03-03.
+\echo '--- Carol, as_of 2026-02-15 [mid-trial] -> expect 1 row ---'
+SELECT * FROM get_active_pricing_plan(:carol_tenant, :platform, '2026-02-15');
+
+\echo '--- Carol, as_of 2026-03-10 [after 30 days, never cancelled] -> expect 0 rows ---'
+SELECT * FROM get_active_pricing_plan(:carol_tenant, :platform, '2026-03-10');
+
+-- Bob's Monthly-359 subscription: started 2026-10-13, 1 month -> covers up to 2026-11-13.
+\echo '--- Bob, as_of 2026-10-20 [mid-period] -> expect BOTH rows (subscription + lifetime pack) ---'
+SELECT * FROM get_active_pricing_plan(:bob_tenant, :platform, '2026-10-20');
+
+\echo '--- Bob, as_of 2026-11-20 [subscription period elapsed, never cancelled] -> expect ONLY the pack ---'
+SELECT * FROM get_active_pricing_plan(:bob_tenant, :platform, '2026-11-20');
+
+\echo '--- Bob, as_of 2030-01-01 [far future] -> lifetime pack still shows, duration IS NULL never expires ---'
+SELECT * FROM get_active_pricing_plan(:bob_tenant, :platform, '2030-01-01');
+
+-- Alice: cancelled outright in 004 -> excluded regardless of as_of.
+\echo '--- Alice, as_of 2026-10-05 [before her cancel date, but row already CANCELLED] -> expect 0 rows ---'
+SELECT * FROM get_active_pricing_plan(:alice_tenant, :platform, '2026-10-05');
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- get_active_pricing_plan(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT * FROM get_active_pricing_plan(:alice_tenant, NULL, '2026-01-01');

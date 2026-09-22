@@ -1,0 +1,56 @@
+-- stonescriptphp-pay :: TEST/DEMO companion of the postpaid-billing objects.
+-- Run with ON_ERROR_STOP=0. This file carries the demo seed data, worked-figure
+-- assertions and the by-design negative (ER*) cases that must NOT ship in the
+-- deployable schema.
+\set rajesh_tenant '''00000000-0000-0000-0000-000000000013'''
+\set annual_tenant '''00000000-0000-0000-0000-000000000014'''
+\set dave_tenant   '''00000000-0000-0000-0000-000000000004'''
+\set platform      '''testplatform'''
+
+-- ================= seed plans =================
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (12, 'Professional Plan', true, true, false, '2026-01-01', 'seed');
+
+INSERT INTO subscription_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by)
+VALUES
+    (7, 12, 1,  'month', 49900,  true, true, true, '2026-01-01', 'seed'),   -- ₹499/mo, POSTPAID
+    (8, 12, 12, 'month', 499000, true, true, true, '2026-01-01', 'seed');   -- ₹4,990/yr = pay-for-10 (12× ₹499 = ₹5,988; 16.67% off), POSTPAID
+
+-- ================= test =================
+-- Rajesh subscribes Monthly (postpaid) on 2026-06-01, then renews at period end.
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:rajesh_tenant, :platform, 12, 7, '2026-06-01', '2026-06-01', 'seed');  -- period 06-01 -> 07-01, invoice ₹499 due 07-01
+
+\echo '--- renew Rajesh monthly at 2026-07-01 (plain renewal, same cadence) -> new period 07-01..08-01 ---'
+SELECT customer_pricing_plan_id, started_at, expires_at, is_switch FROM renew_subscription_pricing_plan(:rajesh_tenant, :platform, 7, '2026-07-01', 'api');
+
+\echo '--- get_postpaid_charges_due(rajesh, 2026-06-15..2026-08-15): expect TWO invoices, ₹499 due 07-01 and ₹499 due 08-01 ---'
+SELECT subscription_pricing_plan_id, amount, period_start, invoice_due_at FROM get_postpaid_charges_due(:rajesh_tenant, :platform, '2026-06-15', '2026-08-15');
+
+\echo '--- sum of postpaid due in that window -> expect 99800 (2 × ₹499) ---'
+SELECT COALESCE(SUM(amount),0) AS total_due FROM get_postpaid_charges_due(:rajesh_tenant, :platform, '2026-06-15', '2026-08-15');
+
+\echo '--- Dave is on a PREPAID monthly plan -> get_postpaid_charges_due(dave, ...) returns 0 rows ---'
+SELECT * FROM get_postpaid_charges_due(:dave_tenant, :platform, '2026-01-01', '2027-01-01');
+
+-- Annual postpaid: invoice ₹4,990 due once, at the end of the 12-month period.
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:annual_tenant, :platform, 12, 8, '2026-01-01', '2026-01-01', 'seed');  -- period 2026-01-01 -> 2027-01-01
+
+\echo '--- get_postpaid_charges_due(annual, 2026-12-01..2027-02-01): expect ONE invoice ₹4,990 (499000) due 2027-01-01 ---'
+SELECT subscription_pricing_plan_id, amount, period_start, invoice_due_at FROM get_postpaid_charges_due(:annual_tenant, :platform, '2026-12-01', '2027-02-01');
+
+\echo '--- annual is exactly 10× monthly (499000 = 10 × 49900); 12× monthly would be 598800, so 16.67% off ---'
+SELECT (SELECT amount FROM subscription_pricing_plans WHERE id = 8) AS annual,
+       10 * (SELECT amount FROM subscription_pricing_plans WHERE id = 7) AS ten_times_monthly,
+       12 * (SELECT amount FROM subscription_pricing_plans WHERE id = 7) AS twelve_times_monthly;
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- get_postpaid_charges_due(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT * FROM get_postpaid_charges_due(:rajesh_tenant, NULL, '2026-01-01', '2027-01-01');

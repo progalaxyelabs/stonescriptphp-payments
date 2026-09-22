@@ -1,0 +1,63 @@
+-- stonescriptphp-pay :: topups at various times/plans, consumption at random
+-- dates, FIFO-by-expiry depletion, forfeiture of unused expired credits,
+-- balance on any given date, and rejection of over-consumption.
+--
+-- Grace's timeline (hand-verified):
+--   2026-01-10  buy 12-pack (₹49)   -> batch A: 12 credits, expires 2026-07-10
+--   2026-01-20  consume 5           -> A: 12-5=7
+--   2026-02-15  buy 25-pack (₹99)   -> batch B: 25 credits, expires 2026-08-15
+--   2026-03-01  consume 10          -> FIFO: A(7)->0, need 3 -> B(25)->22
+--   2026-06-01  buy 51-pack (₹199)  -> batch C: 51 credits, expires 2026-12-01
+--   [2026-07-10] A expires, 0 left anyway, nothing forfeited
+--   [2026-08-15] B expires with 22 UNUSED -> forfeited, no refund
+--   2026-09-01  consume 10          -> A expired, B expired(skip) -> C(51)->41
+--   2026-09-05  attempt consume 999 -> only 41 available -> ER009
+--   [2026-12-01] C expires with 41 UNUSED -> forfeited eventually too
+\set grace_tenant '''00000000-0000-0000-0000-000000000007'''
+\set platform     '''testplatform'''
+
+INSERT INTO customer_pricing_plans (tenant_id, platform_code, pricing_plan_id, one_time_pricing_plan_id, started_at, created_at, created_by)
+VALUES (:grace_tenant, :platform, 6, 3, '2026-01-10', '2026-01-10', 'seed');  -- batch A: 12-pack
+
+\echo '--- balance as of 2026-01-15 [before any consumption] -> expect 12 ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-01-15');
+
+SELECT * FROM consume_credits(:grace_tenant, :platform, '2026-01-20', 5, 'api');
+
+\echo '--- balance as of 2026-01-25 [after consuming 5 from batch A] -> expect 7 ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-01-25');
+
+INSERT INTO customer_pricing_plans (tenant_id, platform_code, pricing_plan_id, one_time_pricing_plan_id, started_at, created_at, created_by)
+VALUES (:grace_tenant, :platform, 7, 4, '2026-02-15', '2026-02-15', 'seed');  -- batch B: 25-pack
+
+SELECT * FROM consume_credits(:grace_tenant, :platform, '2026-03-01', 10, 'api');
+-- FIFO: 7 from A (A now 0), 3 from B (B now 22)
+
+\echo '--- balance as of 2026-03-05 -> expect 22 (all remaining now in batch B) ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-03-05');
+
+INSERT INTO customer_pricing_plans (tenant_id, platform_code, pricing_plan_id, one_time_pricing_plan_id, started_at, created_at, created_by)
+VALUES (:grace_tenant, :platform, 8, 5, '2026-06-01', '2026-06-01', 'seed');  -- batch C: 51-pack
+
+\echo '--- balance as of 2026-07-15 [batch A expired 07-10, nothing forfeited, B+C still open] -> expect 73 (22+51) ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-07-15');
+
+\echo '--- balance as of 2026-08-20 [batch B expired 08-15 with 22 UNUSED -> forfeited] -> expect 51 (only C) ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-08-20');
+
+SELECT * FROM consume_credits(:grace_tenant, :platform, '2026-09-01', 10, 'api');
+-- only C is open (A empty+expired, B expired-forfeited) -> C: 51-10=41
+
+\echo '--- balance as of 2026-09-01 -> expect 41 ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-09-01');
+
+\echo '--- consume_credits(grace, 2026-09-05, 999, ...) — only 41 available -> expect ER009 ---'
+SELECT * FROM consume_credits(:grace_tenant, :platform, '2026-09-05', 999, 'api');
+
+\echo '--- balance as of 2026-12-05 [batch C expired 12-01 with 41 UNUSED -> forfeited] -> expect 0 ---'
+SELECT get_customer_credit_balance(:grace_tenant, :platform, '2026-12-05');
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- get_customer_credit_balance(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT get_customer_credit_balance(:grace_tenant, NULL, '2026-01-01');

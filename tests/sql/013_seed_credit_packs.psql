@@ -1,0 +1,20 @@
+-- stonescriptphp-invoice :: invoice-scan credit packs — 3 independent
+-- SKUs (not variants of one identity, unlike Monthly/Annual — a customer can
+-- buy any of them, any number of times, in any combination). Each credit
+-- expires 6 months from ITS purchase date, no refund after expiry.
+-- Prices are GST-INCLUSIVE (~₹4/credit incl. GST, stated explicitly).
+
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (6, 'Invoice Scan Credits — 12', false, true, false, '2026-01-01', 'seed'),
+    (7, 'Invoice Scan Credits — 25', false, true, false, '2026-01-01', 'seed'),
+    (8, 'Invoice Scan Credits — 51', false, true, false, '2026-01-01', 'seed');
+
+INSERT INTO one_time_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, credit_quantity, amount, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (3, 6, 6, 'month', false, true, 12,  4900,  false, true, '2026-01-01', 'seed'),  -- 12 credits, ₹49 incl. GST
+    (4, 7, 6, 'month', false, true, 25,  9900,  false, true, '2026-01-01', 'seed'),  -- 25 credits, ₹99 incl. GST
+    (5, 8, 6, 'month', false, true, 51,  19900, false, true, '2026-01-01', 'seed');  -- 51 credits, ₹199 incl. GST
+
+\echo '--- get_pricing_plans() — the 3 credit packs should now be listed alongside everything else ---'
+SELECT * FROM get_pricing_plans();

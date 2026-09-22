@@ -1,0 +1,56 @@
+-- stonescriptphp-pay :: TEST/DEMO companion of src/Metering/Schema/{tables,functions}
+-- passthrough cost-plus objects. Run with ON_ERROR_STOP=0. This file carries the
+-- demo seed data, worked-figure assertions and the by-design negative (ER*)
+-- cases that must NOT ship in the deployable schema.
+\set acme_tenant '''00000000-0000-0000-0000-000000000011'''
+\set platform    '''testplatform'''
+
+-- ================= seed + test =================
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (11, 'Managed Hosting Plan', false, true, false, '2026-07-01', 'seed');
+
+-- go-forward domestic shape: markup on cost, 10% (COGS × 1.10).
+INSERT INTO passthrough_pricing_plans
+    (id, pricing_plan_id, margin_mode, margin_pct, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (1, 11, 'on_cost', 10.0000, true, true, '2026-07-01', 'seed');
+
+\echo '--- derive_price_from_cost sanity: COGS 176426 @ on_cost/10 -> 194069 ; @ on_price/10 -> 196029 ---'
+SELECT derive_price_from_cost(176426, 'on_cost', 10.0) AS on_cost_10,
+       derive_price_from_cost(176426, 'on_price', 10.0) AS on_price_10;
+
+\echo '--- record July COGS ₹1,764.26 (176426 paisa, measured example) ---'
+SELECT period_start, period_end, measured_cost FROM record_passthrough_cost(:acme_tenant, :platform, 11, '2026-07-01', '2026-08-01', 176426, '2026-08-09', 'billing');
+
+\echo '--- record Aug COGS ₹10,000.00 (1000000 paisa, measured example) ---'
+SELECT measured_cost FROM record_passthrough_cost(:acme_tenant, :platform, 11, '2026-08-01', '2026-09-01', 1000000, '2026-09-09', 'billing');
+
+\echo '--- get_passthrough_charge(acme, Jul 1 - Aug 31) -> expect 1294069 (194069 [₹1,940.69] + 1100000 [₹11,000.00]) ---'
+SELECT get_passthrough_charge(:acme_tenant, :platform, '2026-07-01', '2026-08-31');
+
+-- Margin re-configured to 15% on 2026-09-01 — a one-row config change, not a
+-- code change. Deactivate old first (one active per plan), then supersede once
+-- the new row exists (FK must resolve).
+UPDATE passthrough_pricing_plans SET is_active = false WHERE id = 1;
+INSERT INTO passthrough_pricing_plans
+    (id, pricing_plan_id, margin_mode, margin_pct, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (2, 11, 'on_cost', 15.0000, true, true, '2026-09-01', 'seed');
+UPDATE passthrough_pricing_plans SET superseded_by_passthrough_pricing_plan_id = 2 WHERE id = 1;
+
+\echo '--- get_passthrough_charge(acme, Jul 1 - Aug 31) AFTER config change -> STILL 1294069 (July/Aug pinned at 10%) ---'
+SELECT get_passthrough_charge(:acme_tenant, :platform, '2026-07-01', '2026-08-31');
+
+\echo '--- record Sep COGS ₹10,000.00 under the NEW 15% config ---'
+SELECT measured_cost FROM record_passthrough_cost(:acme_tenant, :platform, 11, '2026-09-01', '2026-10-01', 1000000, '2026-10-09', 'billing');
+
+\echo '--- get_passthrough_charge(acme, Sep 1 - Sep 30) -> expect 1150000 (₹11,500.00 at COGS × 1.15) ---'
+SELECT get_passthrough_charge(:acme_tenant, :platform, '2026-09-01', '2026-09-30');
+
+\echo '--- record_passthrough_cost against a pricing_plan with no passthrough plan (5=Standard Sub) -> expect ER019 ---'
+SELECT * FROM record_passthrough_cost(:acme_tenant, :platform, 5, '2026-09-01', '2026-10-01', 1000, '2026-10-09', 'billing');
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- get_passthrough_charge(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT get_passthrough_charge(:acme_tenant, NULL, '2026-07-01', '2026-08-31');

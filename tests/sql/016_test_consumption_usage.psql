@@ -1,0 +1,58 @@
+-- stonescriptphp-pay :: postpaid consumption billing — enroll once, meter
+-- usage daily across 20-31 July, prove the total charge lands EXACTLY on
+-- ₹12,345.67, then prove a later rate change never rewrites that charge
+-- but DOES apply to all new usage from the moment it takes effect.
+--
+-- Daily compute-unit usage (July 20-31), chosen to sum to exactly 1,234,567 units
+-- at 1 paisa/unit = ₹12,345.67:
+--   20:80000 21:95000 22:110000 23:105000 24:90000 25:88000
+--   26:102000 27:115000 28:120000 29:98000 30:91000 31:140567
+\set tenant_8    '''00000000-0000-0000-0000-000000000008'''
+\set tenant_9    '''00000000-0000-0000-0000-000000000009'''
+\set platform    '''testplatform'''
+
+SELECT * FROM enroll_consumption_plan(:tenant_8, :platform, 1, '2026-07-01', 'api');
+
+SELECT record_usage(:tenant_8, :platform, '2026-07-20', 80000,  'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-21', 95000,  'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-22', 110000, 'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-23', 105000, 'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-24', 90000,  'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-25', 88000,  'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-26', 102000, 'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-27', 115000, 'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-28', 120000, 'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-29', 98000,  'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-30', 91000,  'metering');
+SELECT record_usage(:tenant_8, :platform, '2026-07-31', 140567, 'metering');
+
+\echo '--- get_customer_usage_charge(tenant_8, 2026-07-20, 2026-07-31) -> expect EXACTLY 1234567 paisa = ₹12,345.67 ---'
+SELECT get_customer_usage_charge(:tenant_8, :platform, '2026-07-20', '2026-07-31');
+
+-- 5 August: rate doubles to 2 paisa/unit. No grandfathering: this applies to
+-- ALL new usage immediately, but must NOT touch July's already-recorded charge.
+INSERT INTO consumption_pricing_plans
+    (id, pricing_plan_id, unit_of_measure, rate_per_unit, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (2, 9, 'compute-unit', 2, true, true, '2026-08-05', 'seed');
+
+UPDATE consumption_pricing_plans
+SET is_active = false, superseded_by_consumption_pricing_plan_id = 2
+WHERE id = 1;
+
+\echo '--- get_customer_usage_charge(tenant_8, 2026-07-20, 2026-07-31) AFTER the rate change -> still EXACTLY 1234567 (unchanged) ---'
+SELECT get_customer_usage_charge(:tenant_8, :platform, '2026-07-20', '2026-07-31');
+
+SELECT record_usage(:tenant_8, :platform, '2026-08-10', 50000, 'metering');
+
+\echo '--- get_customer_usage_charge(tenant_8, 2026-08-01, 2026-08-31) -> expect 100000 paisa = ₹1,000.00 (50000 units @ NEW 2-paisa rate) ---'
+SELECT get_customer_usage_charge(:tenant_8, :platform, '2026-08-01', '2026-08-31');
+
+\echo '--- enroll_consumption_plan(tenant_8, ...) again -> expect ER010, only one row ever ---'
+SELECT * FROM enroll_consumption_plan(:tenant_8, :platform, 1, '2026-09-01', 'api');
+
+\echo '--- record_usage(tenant_9, ...) — not enrolled at all -> expect ER012 ---'
+SELECT record_usage(:tenant_9, :platform, '2026-08-01', 100, 'metering');
+
+\echo '--- enroll_consumption_plan(tenant_9, 1, ...) — targeting the now-superseded rate row -> expect ER011 ---'
+SELECT * FROM enroll_consumption_plan(:tenant_9, :platform, 1, '2026-09-01', 'api');

@@ -1,0 +1,14 @@
+-- stonescriptphp-invoice :: an example metered postpaid consumption plan
+-- Rate = 1 paisa per compute-unit (illustrative — no real rate card
+-- available; chosen only so the worked example lands on an exact number).
+
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (9, 'Metered Compute Workspace', false, true, false, '2026-07-01', 'seed');
+
+INSERT INTO consumption_pricing_plans
+    (id, pricing_plan_id, unit_of_measure, rate_per_unit, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (1, 9, 'compute-unit', 1, true, true, '2026-07-01', 'seed');  -- ₹0.01 / compute-unit, + GST
+
+\echo '--- get_pricing_plans() — the metered consumption plan is NOT listed (get_pricing_plans only knows sub/one-time today) ---'
+SELECT * FROM get_pricing_plans();

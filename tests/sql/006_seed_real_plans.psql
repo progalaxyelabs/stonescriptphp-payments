@@ -1,0 +1,29 @@
+-- stonescriptphp-invoice :: an example production catalog (as opposed to 004/005's illustrative test scenario)
+--   Free Trial      — 30 days, ₹0, prepaid
+--   Lifetime         — one-time, ₹1,999 + GST
+--   Standard Subscription — two active price variants:
+--       1 month  — ₹349  + GST
+--       12 months — ₹3,839 + GST  (= 11 × ₹349, 8.33% off paying monthly x12)
+-- All catalog dated 2026-01-01 (explicit, no now()/CURRENT_DATE — same rule as before).
+-- IDs continue the existing sequence (pricing_plans 1,2 / subscription_pricing_plans 1,2 /
+-- one_time_pricing_plans 1 already used by 004/005's test scenario).
+
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (3, 'Free Trial',             true,  true, true,  '2026-01-01', 'seed'),
+    (4, 'Lifetime License',       false, true, false, '2026-01-01', 'seed'),
+    (5, 'Standard Subscription',  true,  true, false, '2026-01-01', 'seed');
+
+INSERT INTO subscription_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by)
+VALUES
+    (3, 3, 30, 'day',   0,      true, false, true, '2026-01-01', 'seed'),  -- Trial: ₹0
+    (4, 5, 1,  'month', 34900,  true, false, true, '2026-01-01', 'seed'),  -- ₹349 + GST / month
+    (5, 5, 12, 'month', 383900, true, false, true, '2026-01-01', 'seed');  -- ₹3,839 + GST / 12 months
+
+INSERT INTO one_time_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, amount, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (2, 4, NULL, NULL, true, false, 199900, true, true, '2026-01-01', 'seed');  -- ₹1,999 + GST, lifetime
+
+\echo '--- get_pricing_plans() — should list all 4: Trial, 1mo, 12mo, Lifetime ---'
+SELECT * FROM get_pricing_plans();

@@ -1,0 +1,195 @@
+-- stonescriptphp-invoice :: TEST — durable product->central invoice INTIMATION via the
+--   transactional outbox: atomic enqueue, durable lifecycle (claim/deliver/fail/
+--   retry), idempotent central apply, consistency guard, and the reverse paid leg.
+-- Run with ON_ERROR_STOP=0. Positive assertions print  ok_* = t. Negative cases are
+-- DO blocks printing 'ok: ERxxx raised' when the intended SQLSTATE fires.
+--
+-- Hand-derived numbers (integer paisa) — all these invoices are India intrastate
+-- ₹499 @18% exclusive, the SAME shape proven in 036:
+--   taxable = 49900 ; line GST = halfUp(49900*1800,10000)/... = 8982
+--   CGST = SGST = halfUp(8982,2) = 4491 ; IGST = 0 ; GROSS = 49900+4491+4491 = 58882
+-- So every payload/central amount below is 58882 in INR.
+\set tenant_101  '''00000000-0000-0000-0000-000000000101'''
+\set platform    '''testplatform'''
+
+\echo ''
+\echo '======== Req 1: ATOMIC ENQUEUE — issuing an invoice creates EXACTLY ONE pending outbox row ========'
+SELECT inv_issue_invoice(
+    'INV-000601', :tenant_101, :platform, 'subscription', 'cpp:101:outbox',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+\echo '--- exactly one PENDING to_central/invoice_issued row, payload amount 58882 -> ok=t ---'
+SELECT (count(*)=1 AND max(status)='pending' AND max(event_type)='invoice_issued' AND max(direction)='to_central'
+        AND max((payload->>'amount_minor')::bigint)=58882 AND max(payload->>'currency')='INR') AS ok_enqueue
+FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601');
+
+\echo ''
+\echo '======== Req 1: ATOMICITY — rolling back the issue rolls back the outbox row (neither can exist alone) ========'
+BEGIN;
+SELECT inv_issue_invoice(
+    'INV-000699', :tenant_101, :platform, 'subscription', 'cpp:101:rollback',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+\echo '--- INSIDE the txn: invoice present AND its one pending outbox row present -> ok=t ---'
+SELECT ((SELECT count(*) FROM inv_invoices WHERE invoice_number='INV-000699')=1
+        AND (SELECT count(*) FROM inv_outbox WHERE payload->>'invoice_number'='INV-000699' AND status='pending')=1) AS ok_atomic_in_txn;
+ROLLBACK;
+\echo '--- AFTER ROLLBACK: BOTH gone — the outbox row cannot survive without its invoice -> ok=t ---'
+SELECT ((SELECT count(*) FROM inv_invoices WHERE invoice_number='INV-000699')=0
+        AND (SELECT count(*) FROM inv_outbox WHERE payload->>'invoice_number'='INV-000699')=0) AS ok_atomic_after_rollback;
+
+\echo ''
+\echo '======== Req 2: CLAIM-DUE returns the pending row ========'
+\echo '--- claim as of 2026-09-01 12:00 finds INV-000601 (1 row) -> ok=t ---'
+SELECT (count(*)=1) AS ok_claim_due
+FROM inv_outbox_claim_due(100, '2026-09-01 12:00+05:30')
+WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601');
+
+\echo ''
+\echo '======== Req 3: MARK-DELIVERED -> terminal + central row created (idempotent apply) ========'
+SELECT inv_outbox_deliver(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601') AND direction='to_central'),
+    '2026-09-13 12:00+05:30') AS delivered;
+\echo '--- outbox job now delivered (terminal), delivered_at stamped -> ok=t ---'
+SELECT (status='delivered' AND delivered_at='2026-09-13 12:00+05:30' AND next_attempt_at IS NULL) AS ok_delivered
+FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601') AND direction='to_central';
+\echo '--- exactly ONE central row created, amount 58882, status issued, apply_count 1 -> ok=t ---'
+SELECT (count(*)=1 AND max(amount_minor)=58882 AND max(currency)='INR' AND max(status)='issued'
+        AND max(apply_count)=1 AND max(platform_code)='testplatform' AND bool_and(tenant_id='00000000-0000-0000-0000-000000000101'::uuid)) AS ok_central
+FROM central_minimal_invoices WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601');
+
+\echo ''
+\echo '======== Req 3: RE-DELIVER the SAME intimation -> STILL exactly one central row (idempotent) ========'
+-- (a) apply the same event (same seq) directly again; (b) run the whole deliver again.
+SELECT central_apply_intimation(o.payload || jsonb_build_object('seq', o.id), '2026-09-13 13:00+05:30') AS reapplied
+FROM inv_outbox o WHERE o.invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601') AND o.direction='to_central';
+SELECT inv_outbox_deliver(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601') AND direction='to_central'),
+    '2026-09-13 13:00+05:30') AS delivered_again;
+\echo '--- still exactly ONE central row, apply_count still 1 (same-seq replay is a no-op) -> ok=t ---'
+SELECT (count(*)=1 AND max(apply_count)=1 AND max(status)='issued') AS ok_idempotent
+FROM central_minimal_invoices WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601');
+
+\echo ''
+\echo '======== Req 2: SIMULATED FAILURE -> failed + next_attempt_at set, then a later claim re-picks and succeeds ========'
+SELECT inv_issue_invoice(
+    'INV-000602', :tenant_101, :platform, 'subscription', 'cpp:101:retry',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+-- the relay claimed it, the POST to central errored -> mark_failed with a backoff instant
+SELECT inv_outbox_mark_failed(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000602') AND direction='to_central'),
+    'central 503 unreachable', '2026-09-14 10:00+05:30') AS marked;
+\echo '--- status failed, attempts 1, next_attempt_at + last_error set (NOT delivered, NOT dropped) -> ok=t ---'
+SELECT (status='failed' AND attempts=1 AND next_attempt_at='2026-09-14 10:00+05:30' AND last_error='central 503 unreachable') AS ok_failed
+FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000602') AND direction='to_central';
+\echo '--- a claim BEFORE the backoff instant does NOT re-pick it (0 rows) -> ok=t ---'
+SELECT (count(*)=0) AS ok_not_due_before_backoff
+FROM inv_outbox_claim_due(100, '2026-09-14 09:00+05:30')
+WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000602');
+\echo '--- a claim AFTER the backoff instant DOES re-pick it (1 row) -> ok=t ---'
+SELECT (count(*)=1) AS ok_reclaimed_after_backoff
+FROM inv_outbox_claim_due(100, '2026-09-14 11:00+05:30')
+WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000602');
+-- second attempt succeeds
+SELECT inv_outbox_deliver(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000602') AND direction='to_central'),
+    '2026-09-14 11:05+05:30') AS delivered;
+\echo '--- retry delivered -> terminal delivered AND central row now exists -> ok=t ---'
+SELECT (o.status='delivered' AND o.attempts=1
+        AND (SELECT count(*) FROM central_minimal_invoices c WHERE c.invoice_id=o.invoice_id)=1) AS ok_retry_succeeds
+FROM inv_outbox o WHERE o.invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000602') AND o.direction='to_central';
+
+\echo ''
+\echo '======== Req: CONSISTENCY GUARD — NO issued invoice lacks its outbox row (over the whole set) ========'
+\echo '--- inv_outbox_consistency_leaks() is empty (0) — every issued invoice has a forward row -> ok=t ---'
+SELECT (count(*)=0) AS ok_no_leak FROM inv_outbox_consistency_leaks();
+\echo '--- no dead-letters -> ok=t ---'
+SELECT (count(*)=0) AS ok_no_dead FROM inv_outbox_dead_letters();
+\echo '--- BACKFILL proof: a pre-outbox invoice (INV-000501 from 036) also has its forward row -> ok=t ---'
+SELECT (count(*)=1) AS ok_backfill_covers_prior
+FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000501') AND direction='to_central';
+
+\echo ''
+\echo '======== Req 4: REVERSE LEG — central marks paid -> propagates BACK to the product (once) ========'
+SELECT inv_issue_invoice(
+    'INV-000603', :tenant_101, :platform, 'subscription', 'cpp:101:reverse',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+-- forward-intimate central, then make the product invoice due so it can be settled
+SELECT inv_outbox_deliver(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000603') AND direction='to_central'),
+    '2026-09-13 12:00+05:30') AS fwd_delivered;
+SELECT inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-000603'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000603'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000603'),'due','cron','2026-10-01') AS new_status;
+-- payment captured AT CENTRAL -> central paid + reverse outbox enqueued atomically
+SELECT central_record_payment(
+    (SELECT id FROM inv_invoices WHERE invoice_number='INV-000603'),
+    (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000603'),
+    (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000603'),
+    'razorpay','rzp_rev_603',58882,'INR','2026-10-05 10:00+05:30','central-webhook','2026-10-05 10:00+05:30') AS central_pay_id;
+\echo '--- central now paid AND exactly one pending to_product reverse row enqueued -> ok=t ---'
+SELECT (c.status='paid' AND c.paid_at='2026-10-05 10:00+05:30' AND c.gateway_txn_ref='rzp_rev_603'
+        AND (SELECT count(*) FROM inv_outbox o WHERE o.invoice_id=c.invoice_id AND o.direction='to_product' AND o.status='pending')=1) AS ok_reverse_enqueued
+FROM central_minimal_invoices c WHERE c.invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000603');
+-- deliver the reverse intimation -> product goes paid (read-only eligible)
+SELECT inv_outbox_deliver(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000603') AND direction='to_product'),
+    '2026-10-05 10:05+05:30') AS rev_delivered;
+\echo '--- paid reached the PRODUCT: invoice paid + exactly one success payment -> ok=t ---'
+SELECT (i.status='paid'
+        AND (SELECT count(*) FROM inv_payments p WHERE p.invoice_id=i.id AND p.status='success')=1) AS ok_paid_reaches_product
+FROM inv_invoices i WHERE i.invoice_number='INV-000603';
+\echo '--- re-applying the reverse intimation is a no-op: still paid, still ONE success payment -> ok=t ---'
+SELECT product_apply_paid(o.payload || jsonb_build_object('seq', o.id), '2026-10-05 11:00+05:30') AS reapplied
+FROM inv_outbox o WHERE o.invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000603') AND o.direction='to_product';
+SELECT (i.status='paid'
+        AND (SELECT count(*) FROM inv_payments p WHERE p.invoice_id=i.id AND p.status='success')=1) AS ok_reverse_idempotent
+FROM inv_invoices i WHERE i.invoice_number='INV-000603';
+
+\echo ''
+\echo '======== Negatives — intended custom SQLSTATEs ========'
+\echo '--- ER062: mark_delivered on a non-existent outbox job ---'
+DO $$ BEGIN BEGIN
+    PERFORM inv_outbox_mark_delivered(999999, '2026-09-13');
+    RAISE NOTICE 'FAIL: expected ER062, got no error';
+EXCEPTION WHEN SQLSTATE 'ER062' THEN RAISE NOTICE 'ok: ER062 raised (outbox job not found)';
+         WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER062, got %', SQLSTATE; END; END $$;
+
+\echo '--- ER063: mark_failed on an already-DELIVERED (terminal) job ---'
+DO $$ BEGIN BEGIN
+    PERFORM inv_outbox_mark_failed(
+        (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000601') AND direction='to_central'),
+        'late error', '2026-09-20');
+    RAISE NOTICE 'FAIL: expected ER063, got no error';
+EXCEPTION WHEN SQLSTATE 'ER063' THEN RAISE NOTICE 'ok: ER063 raised (cannot fail a delivered job)';
+         WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER063, got %', SQLSTATE; END; END $$;
+
+\echo '--- ER064: central_apply_intimation with a payload missing invoice_id ---'
+DO $$ BEGIN BEGIN
+    PERFORM central_apply_intimation('{"seq":1}'::jsonb, '2026-09-13');
+    RAISE NOTICE 'FAIL: expected ER064, got no error';
+EXCEPTION WHEN SQLSTATE 'ER064' THEN RAISE NOTICE 'ok: ER064 raised (payload missing required field)';
+         WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER064, got %', SQLSTATE; END; END $$;
+
+\echo ''
+\echo '======== DONE — every ok_* above must be t; every negative shows an ok: ERxxx line ========'

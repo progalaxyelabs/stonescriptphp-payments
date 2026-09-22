@@ -1,0 +1,59 @@
+-- stonescriptphp-pay :: prove the credit/refund ledger end to end (Case 7).
+-- Heidi subscribes Annual, switches to Monthly mid-year — renew computes a
+-- prorated credit and RETURNS it; we BANK it (via \gset, exactly as an app
+-- would thread the returned value), draw it down against monthly charges, add
+-- a goodwill refund, and prove the balance tracks every movement.
+\set heidi_tenant '''00000000-0000-0000-0000-000000000012'''
+\set platform     '''testplatform'''
+
+-- Heidi starts on the Annual plan (₹3,839, subscription_pricing_plan id 5,
+-- under Standard Subscription pricing_plan 5) on 2026-01-01.
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:heidi_tenant, :platform, 5, 5, '2026-01-01', '2026-01-01', 'seed');
+
+-- Switch Annual -> Monthly on 2026-04-01 (3 whole months in): renew computes a
+-- prorated credit = 9/12 of ₹3,839 = 287925 and RETURNS it. \gset captures the
+-- returned value straight into a psql variable, exactly as an app would take
+-- the response field and bank it. ONE switch, one capture (no double renewal).
+\echo '--- switch Annual -> Monthly, capturing is_switch + prorated credit via \gset ---'
+SELECT is_switch, prorated_credit_paisa AS cr
+FROM renew_subscription_pricing_plan(:heidi_tenant, :platform, 6, '2026-04-01', 'api') \gset
+\echo 'captured is_switch (expect t):' :is_switch
+\echo 'captured prorated credit (expect 287925):' :cr
+
+\echo '--- bank the prorated credit (expect amount 287925) ---'
+SELECT entry_type, amount FROM record_credit_ledger_entry(:heidi_tenant, :platform, :cr, 'proration_credit', 'switch annual->monthly', 'cpp-switch', '2026-04-01', 'api');
+
+\echo '--- ledger balance @ 2026-04-01 -> expect 287925 ---'
+SELECT get_credit_ledger_balance(:heidi_tenant, :platform, '2026-04-01');
+
+\echo '--- apply to first monthly charge ₹399 (39900): expect applied 39900, remaining 0, balance_after 248025 ---'
+SELECT * FROM apply_credit_to_charge(:heidi_tenant, :platform, 39900, '2026-04-01', 'api', 'monthly-apr');
+
+\echo '--- ledger balance @ 2026-04-02 -> expect 248025 ---'
+SELECT get_credit_ledger_balance(:heidi_tenant, :platform, '2026-04-02');
+
+\echo '--- add a ₹50 goodwill refund (5000) on 2026-04-10 -> balance 253025 ---'
+SELECT entry_type, amount FROM record_credit_ledger_entry(:heidi_tenant, :platform, 5000, 'refund', 'goodwill', 'ticket-123', '2026-04-10', 'support');
+
+\echo '--- ledger balance @ 2026-04-11 -> expect 253025 ---'
+SELECT get_credit_ledger_balance(:heidi_tenant, :platform, '2026-04-11');
+
+\echo '--- apply to a ₹3,000 charge (300000): balance 253025 < charge, expect applied 253025, remaining 46975, balance_after 0 ---'
+SELECT * FROM apply_credit_to_charge(:heidi_tenant, :platform, 300000, '2026-05-01', 'api', 'charge-may');
+
+\echo '--- ledger balance @ 2026-05-02 -> expect 0 ---'
+SELECT get_credit_ledger_balance(:heidi_tenant, :platform, '2026-05-02');
+
+\echo '--- apply to a ₹100 charge with an empty balance: expect applied 0, remaining 10000, balance_after 0 (no failure) ---'
+SELECT * FROM apply_credit_to_charge(:heidi_tenant, :platform, 10000, '2026-05-03', 'api', 'charge-empty');
+
+\echo '--- record a zero/negative ledger entry -> expect ER020 ---'
+SELECT * FROM record_credit_ledger_entry(:heidi_tenant, :platform, 0, 'adjustment', 'bad', NULL, '2026-05-03', 'api');
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- apply_credit_to_charge(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT * FROM apply_credit_to_charge(:heidi_tenant, NULL, 100, '2026-05-03', 'api', NULL);

@@ -1,0 +1,19 @@
+-- stonescriptphp-pay :: diagnostic — deactivate the old 004/005 illustrative
+-- test plans (pricing_plan_id 1 'Monthly' and 2 '10-hr Homework Assistant
+-- Pack') now that 006 has seeded the example catalog, and check that
+-- downstream reads still behave correctly when a parent plan is deactivated.
+\set alice_tenant '''00000000-0000-0000-0000-000000000001'''
+\set bob_tenant   '''00000000-0000-0000-0000-000000000002'''
+\set platform     '''testplatform'''
+
+UPDATE pricing_plans SET is_active = false WHERE id IN (1, 2);
+
+\echo '--- get_pricing_plans() — should now list ONLY the 4 catalog rows ---'
+SELECT * FROM get_pricing_plans();
+
+\echo '--- get_customer_pricing_plan(bob)  [Bob] — must STILL show both his rows, ---'
+\echo '--- even though their parent pricing_plans are now is_active=false ---'
+SELECT * FROM get_customer_pricing_plan(:bob_tenant, :platform);
+
+\echo '--- get_customer_pricing_plan(alice)  [Alice] — 0 rows expected (already cancelled earlier) ---'
+SELECT * FROM get_customer_pricing_plan(:alice_tenant, :platform);

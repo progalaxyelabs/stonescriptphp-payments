@@ -1,0 +1,24 @@
+-- stonescriptphp-pay :: prove start_free_trial() + the trial-cancel block
+\set carol_tenant '''00000000-0000-0000-0000-000000000003'''
+\set platform     '''testplatform'''
+
+\echo '--- start_free_trial(carol, ...) — first time, should succeed ---'
+SELECT * FROM start_free_trial(:carol_tenant, :platform, '2026-02-01', 'api');
+
+\echo '--- start_free_trial(carol, ...) again — expect ER005, already used ---'
+SELECT * FROM start_free_trial(:carol_tenant, :platform, '2026-02-05', 'api');
+
+\echo '--- cancel_subscription_pricing_plan(<Carol''s trial row>, ...) — expect ER007 ---'
+SELECT * FROM cancel_subscription_pricing_plan(
+    (SELECT id FROM customer_pricing_plans WHERE tenant_id = :carol_tenant AND platform_code = :platform),
+    '2026-02-10',
+    'customer_requested'
+);
+
+\echo '--- get_customer_pricing_plan(carol)  [Carol] — trial still active, cancel was blocked ---'
+SELECT * FROM get_customer_pricing_plan(:carol_tenant, :platform);
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- start_free_trial(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT * FROM start_free_trial(:carol_tenant, NULL, '2026-02-01', 'api');

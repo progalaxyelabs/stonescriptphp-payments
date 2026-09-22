@@ -1,0 +1,259 @@
+-- stonescriptphp-pay :: TEST — persisted invoices + payments + gateway routing +
+--   status lifecycle + duplicate-payment guard + CRM chase subset.
+-- Run with ON_ERROR_STOP=0. Positive assertions print  ok_* = t  (actual vs the
+-- hand-derived number in the \echo above them). Negative cases are DO blocks that
+-- print  'ok: ERxxx raised'  when the intended SQLSTATE fires and 'FAIL: ...'
+-- otherwise — so a green run has every ok_* = t and every negative 'ok:' line.
+--
+-- Hand-derived numbers (all integer paisa):
+--   Scenario A intrastate ₹499 @18% excl:
+--     taxable = 49900
+--     line GST = halfUp(49900*1800,10000) = halfUp(898200000,10000) = 89820 ... /? -> 8982
+--       (2*89820000+10000)/20000 = 179650000/20000 = 8982
+--     CGST = SGST = halfUp(8982,2) = (2*8982+2)/4 = 17966/4 = 4491 ; IGST = 0
+--     gross = 49900 + 4491 + 4491 = 58882
+--   Scenario B export_lut $50.00, zero-rated, currency USD:
+--     taxable = 5000 cents ; cgst=sgst=igst=0 ; gross = 5000 cents ($50.00)
+--     statutory INR @ RBI 95.7245 (from 032):
+--       halfUp(5000 * 957245, 10000) = (2*4786225000+10000)/20000
+--       = 9572460000/20000 = 478623 paisa (₹4786.23)
+\set tenant_101  '''00000000-0000-0000-0000-000000000101'''
+\set tenant_102  '''00000000-0000-0000-0000-000000000102'''
+\set tenant_103  '''00000000-0000-0000-0000-000000000103'''
+\set platform    '''testplatform'''
+
+-- ============ shared fixtures ============
+-- tenant_103 always settles through PayPal regardless of billing country (DATA override)
+INSERT INTO inv_customer_gateway_overrides (tenant_id, platform_code, gateway_code, reason, created_at, created_by) VALUES
+    (:tenant_103, :platform, 'paypal', 'Enterprise MSA settles via PayPal.', '2026-08-01', 'seed');
+
+\echo ''
+\echo '======== Req 1+2: ISSUE a full invoice (India intrastate, ₹499 @18%) ========'
+SELECT inv_issue_invoice(
+    'INV-000501', :tenant_101, :platform, 'subscription', 'cpp:101:2026-08',
+    '2026-08-01', '2026-09-01', '2026-10-01',
+    'IN', 'Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false,
+    'INR', NULL, NULL,
+    '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+
+\echo '--- A stored fields: taxable=49900 cgst=4491 sgst=4491 igst=0 gross=58882 tax_invoice/intrastate/issued -> ok=t ---'
+SELECT (taxable_value_minor=49900 AND cgst_minor=4491 AND sgst_minor=4491 AND COALESCE(igst_minor,0)=0
+        AND gross_total_minor=58882 AND document_type='tax_invoice' AND tax_treatment='intrastate'
+        AND status='issued' AND place_of_supply_code='29') AS ok_A_stored
+FROM inv_invoices WHERE invoice_number='INV-000501';
+
+\echo '--- A line persisted (1 line, SAC 998314, line_total 58882) -> ok=t ---'
+SELECT (count(*)=1 AND max(hsn_sac)='998314' AND max(line_total_minor)=58882) AS ok_A_line
+FROM inv_invoice_lines WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000501');
+
+\echo ''
+\echo '======== Req 4: GATEWAY ROUTING — India -> Razorpay (INR) ========'
+\echo '--- expect razorpay / INR / pay.example.com / country_rule -> ok=t ---'
+SELECT (gateway_code='razorpay' AND settlement_currency='INR'
+        AND checkout_endpoint='https://pay.example.com' AND resolved_by='country_rule') AS ok_route_india
+FROM inv_resolve_gateway((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'));
+
+\echo ''
+\echo '======== Req 1: ISSUE an export invoice (USD, export_lut, zero-rated) ========'
+SELECT inv_issue_invoice(
+    'INV-000502', :tenant_102, 'meteredapp', 'passthrough', 'usage:2026-08',
+    '2026-08-01', '2026-09-01', '2026-10-01',
+    'US', 'Other Country',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Acme LLC',NULL,'buyer','unregistered','Other Country',NULL)::inv_party_input,
+    'export_lut', NULL, false, false,
+    'USD', '95.7245',
+    inv_money_to_decimal_string(inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','50.00')),
+    '2026-09-13',
+    ARRAY[ROW('Website build — export service','998314','1','50.00',0,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-13', 'issued'
+) AS invoice_id;
+
+\echo '--- B stored: gross=5000 taxable=5000 currency=USD amount_inr=478623 export_lut igst=0 -> ok=t ---'
+SELECT (gross_total_minor=5000 AND taxable_value_minor=5000 AND currency='USD'
+        AND amount_inr_minor=478623 AND tax_treatment='export_lut' AND COALESCE(igst_minor,0)=0) AS ok_B_stored
+FROM inv_invoices WHERE invoice_number='INV-000502';
+
+\echo '--- Req 4: export -> PayPal (USD) / paypal.com/invoice / country_rule (wildcard) -> ok=t ---'
+SELECT (gateway_code='paypal' AND settlement_currency='USD'
+        AND checkout_endpoint='https://www.paypal.com/invoice' AND resolved_by='country_rule') AS ok_route_export
+FROM inv_resolve_gateway((SELECT id FROM inv_invoices WHERE invoice_number='INV-000502'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000502'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000502'));
+
+\echo ''
+\echo '======== Req 4: OVERRIDE beats the default rule ========'
+-- INV-000504: India invoice (would route Razorpay) with a per-INVOICE override -> PayPal
+SELECT inv_issue_invoice(
+    'INV-000504', :tenant_101, :platform, 'subscription', 'cpp:101:override',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    'paypal', 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+\echo '--- per-invoice override -> paypal / invoice_override (beats the IN country rule) -> ok=t ---'
+SELECT (gateway_code='paypal' AND resolved_by='invoice_override') AS ok_invoice_override
+FROM inv_resolve_gateway((SELECT id FROM inv_invoices WHERE invoice_number='INV-000504'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000504'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000504'));
+
+-- INV-000505: India invoice for tenant_103 (tenant-level override -> PayPal), NO invoice override
+SELECT inv_issue_invoice(
+    'INV-000505', :tenant_103, :platform, 'subscription', 'cpp:103',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Override Co',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+\echo '--- tenant-level override -> paypal / customer_override (beats the IN country rule) -> ok=t ---'
+SELECT (gateway_code='paypal' AND resolved_by='customer_override') AS ok_customer_override
+FROM inv_resolve_gateway((SELECT id FROM inv_invoices WHERE invoice_number='INV-000505'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000505'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000505'));
+
+\echo ''
+\echo '======== Req 4: NO-MATCH route -> ER052 ========'
+-- INV-000506: an ordinary India invoice (a country that HAS an active
+-- inv_tax_scheme row, so issuance/tax resolution succeeds); then DISABLE
+-- BOTH the India-specific rule and the export wildcard (a DATA change) so no
+-- active rule and no override matches -> ER052 at the GATEWAY-routing step.
+-- (Before the 2026-09-22 tax-scheme wiring this test used a non-'IN' country
+-- ('FR') to force ER052 — that country now correctly fails earlier at ER065
+-- (no tax scheme mapped for FR), which would have masked the ER052 case this
+-- test targets. Using 'IN' here keeps this test isolated to gateway routing,
+-- independent of tax-scheme resolution.)
+SELECT inv_issue_invoice(
+    'INV-000506', :tenant_102, 'meteredapp', 'passthrough', 'usage:in-noroute',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('No-Route Test Co',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL,
+    '2026-09-13',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-13', 'issued'
+) AS invoice_id;
+UPDATE inv_gateway_routing_rules SET is_active=false WHERE match_country_code IS NULL OR match_country_code='IN';  -- disable every route
+DO $$ BEGIN
+  BEGIN
+    PERFORM 1 FROM inv_resolve_gateway((SELECT id FROM inv_invoices WHERE invoice_number='INV-000506'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000506'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000506'));
+    RAISE NOTICE 'FAIL: expected ER052, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER052' THEN RAISE NOTICE 'ok: ER052 raised (no gateway route once every rule is disabled)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER052, got %', SQLSTATE;
+  END;
+END $$;
+UPDATE inv_gateway_routing_rules SET is_active=true WHERE match_country_code IS NULL OR match_country_code='IN';   -- restore
+
+\echo ''
+\echo '======== Req 5: CHECKOUT/ALREADY-PAID guard — payable BEFORE payment ========'
+\echo '--- move INV-000501 issued->due, then payability = payable / razorpay -> ok=t ---'
+SELECT inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'),'due','cron','2026-10-01') AS new_status;
+SELECT (is_payable=true AND reason='payable' AND gateway_code='razorpay' AND gross_total_minor=58882 AND currency='INR') AS ok_payable_before
+FROM inv_invoice_payability((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'));
+
+\echo ''
+\echo '======== Req 3: PAY ONCE (due->paid) ========'
+SELECT inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'),
+    'razorpay','rzp_txn_1',58882,'INR','success','2026-10-05 10:00+05:30','gateway-webhook','2026-10-05 10:00+05:30') AS payment_id;
+\echo '--- INV-000501 now paid, paid_at set, exactly ONE success payment -> ok=t ---'
+SELECT (i.status='paid' AND i.paid_at='2026-10-05 10:00+05:30'
+        AND (SELECT count(*) FROM inv_payments p WHERE p.invoice_id=i.id AND p.status='success')=1) AS ok_paid
+FROM inv_invoices i WHERE i.invoice_number='INV-000501';
+
+\echo '--- Req 5: payability AFTER payment = already_paid, not payable, no gateway button -> ok=t ---'
+SELECT (is_payable=false AND reason='already_paid' AND gateway_code IS NULL) AS ok_payable_after
+FROM inv_invoice_payability((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'));
+
+\echo '--- Req 3: idempotent replay of the SAME gateway txn returns the SAME payment id (no double) -> ok=t ---'
+SELECT (inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'),
+          'razorpay','rzp_txn_1',58882,'INR','success','2026-10-05 10:00+05:30','gateway-webhook','2026-10-06')
+        = (SELECT id FROM inv_payments WHERE gateway_txn_ref='rzp_txn_1')
+        AND (SELECT count(*) FROM inv_payments p JOIN inv_invoices i ON i.id=p.invoice_id
+             WHERE i.invoice_number='INV-000501' AND p.status='success')=1) AS ok_idempotent;
+
+\echo ''
+\echo '======== Req 3: PAY AGAIN (new txn) on a paid invoice -> ER055 (no double charge) ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'),
+        'razorpay','rzp_txn_2',58882,'INR','success','2026-10-07','gateway-webhook','2026-10-07');
+    RAISE NOTICE 'FAIL: expected ER055, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER055' THEN RAISE NOTICE 'ok: ER055 raised (already-paid, second payment refused)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER055, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== Req 2: ILLEGAL status transition -> ER054 ========'
+-- INV-000501 is now paid (terminal, no outgoing edges): paid -> issued is illegal.
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000501'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000501'),'issued','admin','2026-10-08');
+    RAISE NOTICE 'FAIL: expected ER054, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER054' THEN RAISE NOTICE 'ok: ER054 raised (paid->issued is illegal)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER054, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== Req 3/5: paying an ISSUED (not-yet-due) invoice -> ER056 (not payable) ========'
+SELECT inv_issue_invoice(
+    'INV-000507', :tenant_101, :platform, 'subscription', 'cpp:101:notdue',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+\echo '--- payability of an issued (not due) invoice = not_payable_status -> ok=t ---'
+SELECT (is_payable=false AND reason='not_payable_status') AS ok_not_payable_status
+FROM inv_invoice_payability((SELECT id FROM inv_invoices WHERE invoice_number='INV-000507'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000507'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000507'));
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-000507'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000507'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000507'),
+        'razorpay','rzp_txn_507',58882,'INR','success','2026-10-05','gateway-webhook','2026-10-05');
+    RAISE NOTICE 'FAIL: expected ER056, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER056' THEN RAISE NOTICE 'ok: ER056 raised (issued invoice not payable — must be due first)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER056, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== CRM chase minimal-subset view + OVERDUE case ========'
+-- INV-000503: India invoice, becomes due 2026-10-01, left UNPAID -> overdue as of 2026-12-01
+SELECT inv_issue_invoice(
+    'INV-000503', :tenant_101, :platform, 'subscription', 'cpp:101:overdue',
+    '2026-08-01','2026-09-01','2026-10-01','IN','Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+SELECT inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-000503'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000503'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000503'),'due','cron','2026-10-01');
+
+-- NO "customer_name" field anymore (see the identity-column note on
+-- inv_crm_chase_view) — the chase list carries opaque tenant_id/platform_code;
+-- a human display name is resolved by the CRM's own call to the auth/tenant
+-- service, never re-derived here.
+\echo '--- chase row for INV-000503: overdue=t, chase fields present (tenant/platform/amount/currency/due/gateway) -> ok=t ---'
+SELECT (is_overdue=true AND tenant_id=:tenant_101 AND platform_code=:platform AND amount_minor=58882
+        AND currency='INR' AND due_date='2026-10-01' AND gateway_code='razorpay' AND status='due') AS ok_chase_overdue
+FROM inv_crm_chase_list('2026-12-01') WHERE invoice_number='INV-000503';
+
+\echo '--- the PAID invoice INV-000501 does NOT appear in the chase list (only unpaid) -> ok=t ---'
+SELECT (count(*)=0) AS ok_paid_excluded
+FROM inv_crm_chase_list('2026-12-01') WHERE invoice_number='INV-000501';
+
+\echo '--- static minimal view carries exactly the chase columns for the unpaid set -> ok=t ---'
+SELECT (count(*) >= 1
+        AND bool_and(tenant_id IS NOT NULL AND platform_code IS NOT NULL
+                     AND amount_minor IS NOT NULL AND currency IS NOT NULL AND gateway_code IS NOT NULL)) AS ok_min_view
+FROM inv_crm_chase_view;
+
+\echo ''
+\echo '======== DONE — every ok_* above must be t; every negative shows an ok: ERxxx line ========'

@@ -1,0 +1,32 @@
+-- stonescriptphp-pay :: verify the 4 custom SQLSTATEs are really attached
+\set VERBOSITY verbose
+\set bob_tenant   '''00000000-0000-0000-0000-000000000002'''
+\set platform     '''testplatform'''
+
+-- Seed a one-time plan + a tenant holding it, to exercise ER004.
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, created_at, created_by)
+VALUES (2, '10-hr Homework Assistant Pack', false, true, '2026-10-05', 'seed');
+
+INSERT INTO one_time_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, amount, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES (1, 2, NULL, NULL, true, true, 999900, true, true, '2026-10-05', 'seed');
+
+INSERT INTO customer_pricing_plans (tenant_id, platform_code, pricing_plan_id, one_time_pricing_plan_id, started_at, created_at, created_by)
+VALUES (:bob_tenant, :platform, 2, 1, '2026-10-13', '2026-10-13', 'seed');  -- Bob also bought the one-time pack; row id will be 3
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge: there is
+-- no local "customers" existence check anymore (tenant existence is the auth
+-- service's job) — ER001 now fires on a malformed identity (NULL/empty
+-- platform_code), never on a well-formed-but-unenrolled tenant (that
+-- legitimately returns zero rows, exercised in 004).
+\echo '--- ER001: get_customer_pricing_plan(NULL platform_code) — malformed identity ---'
+SELECT * FROM get_customer_pricing_plan(:bob_tenant, NULL);
+
+\echo '--- ER002: cancel_subscription_pricing_plan(999, ...) — unknown customer_pricing_plan ---'
+SELECT * FROM cancel_subscription_pricing_plan(999, '2026-11-01', 'customer_requested');
+
+\echo '--- ER003: cancel_subscription_pricing_plan(1, ...) — already cancelled (Alice, from 004) ---'
+SELECT * FROM cancel_subscription_pricing_plan(1, '2026-11-05', 'customer_requested');
+
+\echo '--- ER004: cancel_subscription_pricing_plan(3, ...) — one-time plan, not a subscription (Bob''s pack) ---'
+SELECT * FROM cancel_subscription_pricing_plan(3, '2026-11-05', 'customer_requested');

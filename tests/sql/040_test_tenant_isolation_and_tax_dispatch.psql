@@ -1,0 +1,268 @@
+-- stonescriptphp-pay :: TEST — cross-tenant isolation (ER067) on the pay path
+--   + dynamic tax-scheme dispatch (ER065/ER068), added 2026-09-22.
+-- Run with ON_ERROR_STOP=0. Negative cases are DO blocks that print
+-- 'ok: ERxxx raised' when the intended SQLSTATE fires and 'FAIL: ...'
+-- otherwise — so a green run has every ok_* = t and every negative 'ok:' line.
+
+\set tenant_A '''00000000-0000-0000-0000-00000000a001'''
+\set tenant_B '''00000000-0000-0000-0000-00000000b002'''
+\set platform_A '''platform_a'''
+\set platform_B '''platform_b'''
+
+-- ============================================================
+-- Fixture: one issued+due invoice owned by tenant_A/platform_A
+-- ============================================================
+SELECT inv_issue_invoice(
+    'INV-ISO-001', :tenant_A, :platform_A, 'subscription', 'cpp:isoA',
+    '2026-08-01', '2026-09-01', '2026-10-01',
+    'IN', 'Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Isolation Test Co',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false,
+    'INR', NULL, NULL,
+    '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+SELECT inv_transition_invoice_status(
+    (SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), :tenant_A, :platform_A, 'due', 'cron', '2026-10-01'
+) AS new_status;
+
+\echo ''
+\echo '======== TENANT ISOLATION — legitimate owner still works (control) ========'
+SELECT (is_payable=true AND reason='payable') AS ok_owner_can_read_payability
+FROM inv_invoice_payability((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), :tenant_A, :platform_A);
+
+\echo ''
+\echo '======== TENANT ISOLATION — inv_invoice_payability: wrong tenant -> ER067 ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM 1 FROM inv_invoice_payability((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), '00000000-0000-0000-0000-00000000b002', 'platform_a');
+    RAISE NOTICE 'FAIL: expected ER067, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER067' THEN RAISE NOTICE 'ok: ER067 raised (payability blocked for a different tenant)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER067, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== TENANT ISOLATION — inv_invoice_payability: right tenant, wrong platform -> ER067 ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM 1 FROM inv_invoice_payability((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), '00000000-0000-0000-0000-00000000a001', 'platform_b');
+    RAISE NOTICE 'FAIL: expected ER067, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER067' THEN RAISE NOTICE 'ok: ER067 raised (payability blocked for a different platform_code)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER067, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== TENANT ISOLATION — inv_resolve_gateway: wrong tenant -> ER067 ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM 1 FROM inv_resolve_gateway((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), '00000000-0000-0000-0000-00000000b002', 'platform_a');
+    RAISE NOTICE 'FAIL: expected ER067, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER067' THEN RAISE NOTICE 'ok: ER067 raised (gateway resolution blocked for a different tenant)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER067, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== TENANT ISOLATION — inv_record_payment: wrong tenant CANNOT pay off another tenant''s invoice -> ER067 ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), '00000000-0000-0000-0000-00000000b002', 'platform_a',
+        'razorpay','rzp_txn_iso_attack',58882,'INR','success','2026-10-05 10:00+05:30','attacker','2026-10-05 10:00+05:30');
+    RAISE NOTICE 'FAIL: expected ER067, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER067' THEN RAISE NOTICE 'ok: ER067 raised (cross-tenant payment refused)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER067, got %', SQLSTATE;
+  END;
+END $$;
+\echo '--- the attack left the invoice untouched: still due, no payment row was inserted -> ok=t ---'
+SELECT (i.status='due'
+        AND NOT EXISTS (SELECT 1 FROM inv_payments p WHERE p.invoice_id=i.id)) AS ok_attack_had_no_effect
+FROM inv_invoices i WHERE i.invoice_number='INV-ISO-001';
+
+\echo ''
+\echo '======== TENANT ISOLATION — inv_transition_invoice_status: wrong platform -> ER067 ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), '00000000-0000-0000-0000-00000000a001', 'platform_b', 'void', 'attacker');
+    RAISE NOTICE 'FAIL: expected ER067, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER067' THEN RAISE NOTICE 'ok: ER067 raised (cross-platform status transition refused)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER067, got %', SQLSTATE;
+  END;
+END $$;
+\echo '--- the invoice is still due (not voided by the attack) -> ok=t ---'
+SELECT (status='due') AS ok_transition_attack_had_no_effect
+FROM inv_invoices WHERE invoice_number='INV-ISO-001';
+
+\echo ''
+\echo '======== TENANT ISOLATION — legitimate owner CAN still pay + transition (control, proves the check is not overbroad) ========'
+SELECT inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-001'), :tenant_A, :platform_A,
+    'razorpay','rzp_txn_iso_legit',58882,'INR','success','2026-10-05 10:00+05:30','gateway-webhook','2026-10-05 10:00+05:30') AS payment_id;
+SELECT (status='paid') AS ok_legit_owner_payment_succeeded
+FROM inv_invoices WHERE invoice_number='INV-ISO-001';
+
+\echo ''
+\echo '======== TENANT ISOLATION — central_record_payment (outbox reverse-leg source): wrong tenant -> ER067 (dev-critique finding, added 2026-09-22) ========'
+-- A second, independent invoice, forward-intimated to central (so
+-- central_minimal_invoices actually has a row to attack).
+SELECT inv_issue_invoice(
+    'INV-ISO-002', :tenant_A, :platform_A, 'subscription', 'cpp:isoA2',
+    '2026-08-01', '2026-09-01', '2026-10-01',
+    'IN', 'Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Isolation Test Co 2',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false,
+    'INR', NULL, NULL,
+    '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+SELECT inv_outbox_deliver(
+    (SELECT id FROM inv_outbox WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-002') AND direction='to_central'),
+    '2026-09-13 12:00+05:30') AS fwd_delivered;
+DO $$ BEGIN
+  BEGIN
+    PERFORM central_record_payment(
+        (SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-002'),
+        '00000000-0000-0000-0000-00000000b002', 'platform_a',
+        'razorpay','rzp_txn_central_attack',58882,'INR','2026-10-05 10:00+05:30','attacker','2026-10-05 10:00+05:30');
+    RAISE NOTICE 'FAIL: expected ER067, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER067' THEN RAISE NOTICE 'ok: ER067 raised (central_record_payment blocked for a different tenant)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER067, got %', SQLSTATE;
+  END;
+END $$;
+\echo '--- the attack left the central invoice untouched: still unpaid, no central_payments row -> ok=t ---'
+SELECT (c.status <> 'paid'
+        AND NOT EXISTS (SELECT 1 FROM central_payments p WHERE p.invoice_id=c.invoice_id)) AS ok_central_attack_had_no_effect
+FROM central_minimal_invoices c WHERE c.invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-002');
+\echo '--- the legitimate owner CAN still record the central payment (control) -> ok=t ---'
+SELECT central_record_payment(
+    (SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-002'),
+    (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-ISO-002'),
+    (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-ISO-002'),
+    'razorpay','rzp_txn_central_legit',58882,'INR','2026-10-05 10:00+05:30','central-webhook','2026-10-05 10:00+05:30') AS central_pay_id;
+SELECT (status='paid') AS ok_central_legit_owner_payment_succeeded
+FROM central_minimal_invoices WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-ISO-002');
+
+-- ============================================================
+-- Dynamic tax-scheme dispatch (033/035 wiring)
+-- ============================================================
+\echo ''
+\echo '======== TAX DISPATCH — a NEW country mapped to the EXISTING in_gst engine (proves DATA-driven dispatch, not a hardcoded ''IN'' check) ========'
+INSERT INTO inv_tax_scheme (billing_country_code, scheme_type, display_name, is_active, created_by)
+VALUES ('BT', 'in_gst', 'Bhutan (test: reuses the in_gst engine via data, not a code change)', TRUE, 'test');
+
+SELECT inv_issue_invoice(
+    'INV-TAX-BT-001', :tenant_A, :platform_A, 'subscription', 'cpp:taxbt',
+    '2026-08-01', '2026-09-01', '2026-10-01',
+    'BT', 'Other Country',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Bhutan Test Co',NULL,'buyer','unregistered','Other Country',NULL)::inv_party_input,
+    'domestic', NULL, false, false,
+    'INR', NULL, NULL,
+    '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed', '2026-09-01', 'issued'
+) AS invoice_id;
+\echo '--- BT invoice computed via the SAME in_gst engine purely because inv_tax_scheme says so -> ok=t ---'
+SELECT (gross_total_minor=58882 AND billing_country_code='BT') AS ok_tax_dynamic_dispatch
+FROM inv_invoices WHERE invoice_number='INV-TAX-BT-001';
+
+\echo ''
+\echo '======== TAX DISPATCH — an UNMAPPED country now fails LOUD at issuance (ER065) instead of silently running the India engine ========'
+-- Before this wiring, inv_issue_invoice never consulted inv_tax_scheme at all,
+-- so ANY 2-letter billing_country_code (e.g. 'DE', which has no inv_tax_scheme
+-- row) would have silently computed via the India GST engine. That is now
+-- impossible: it fails ER065 the moment the resolver runs, before any GST math.
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_issue_invoice(
+        'INV-TAX-DE-001', '00000000-0000-0000-0000-00000000a001', 'platform_a', 'subscription', 'cpp:taxde',
+        '2026-08-01', '2026-09-01', '2026-10-01',
+        'DE', 'Other Country',
+        ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+        ROW('Germany Test Co',NULL,'buyer','unregistered','Other Country',NULL)::inv_party_input,
+        'domestic', NULL, false, false,
+        'INR', NULL, NULL,
+        '2026-09-01',
+        ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+        NULL, 'seed', '2026-09-01', 'issued');
+    RAISE NOTICE 'FAIL: expected ER065, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER065' THEN RAISE NOTICE 'ok: ER065 raised (unmapped country DE — no silent India-GST fallback)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER065, got %', SQLSTATE;
+  END;
+END $$;
+\echo '--- confirm NO invoice was persisted for the rejected DE attempt -> ok=t ---'
+SELECT (count(*)=0) AS ok_no_partial_invoice_on_ER065
+FROM inv_invoices WHERE invoice_number='INV-TAX-DE-001';
+
+\echo ''
+\echo '======== TAX DISPATCH — a country mapped to a scheme_type with NO wired engine -> ER068 ========'
+INSERT INTO inv_tax_scheme (billing_country_code, scheme_type, display_name, is_active, created_by)
+VALUES ('ZZ', 'vat_placeholder', 'Test-only scheme with no compute engine', TRUE, 'test');
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_issue_invoice(
+        'INV-TAX-ZZ-001', '00000000-0000-0000-0000-00000000a001', 'platform_a', 'subscription', 'cpp:taxzz',
+        '2026-08-01', '2026-09-01', '2026-10-01',
+        'ZZ', 'Other Country',
+        ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+        ROW('ZZ Test Co',NULL,'buyer','unregistered','Other Country',NULL)::inv_party_input,
+        'domestic', NULL, false, false,
+        'INR', NULL, NULL,
+        '2026-09-01',
+        ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+        NULL, 'seed', '2026-09-01', 'issued');
+    RAISE NOTICE 'FAIL: expected ER068, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER068' THEN RAISE NOTICE 'ok: ER068 raised (scheme resolved but no compute engine wired for it)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER068, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== TAX DISPATCH — an invalid supply_type is rejected up front (ER069, dev-critique finding) ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_issue_invoice(
+        'INV-TAX-BADSUPPLY-001', '00000000-0000-0000-0000-00000000a001', 'platform_a', 'subscription', 'cpp:badsupply',
+        '2026-08-01', '2026-09-01', '2026-10-01',
+        'IN', 'Karnataka',
+        ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+        ROW('Bad Supply Co',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+        'Domestic', NULL, false, false, -- 'Domestic' (capitalised) — a typo, not the real enum value
+        'INR', NULL, NULL,
+        '2026-09-01',
+        ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+        NULL, 'seed', '2026-09-01', 'issued');
+    RAISE NOTICE 'FAIL: expected ER069, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER069' THEN RAISE NOTICE 'ok: ER069 raised (invalid supply_type "Domestic" rejected up front)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER069, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== TAX DISPATCH — an export invoice with NO seller GSTIN cannot assume the India export scheme (ER070, dev-critique finding) ========'
+DO $$ BEGIN
+  BEGIN
+    PERFORM inv_issue_invoice(
+        'INV-TAX-NOGSTIN-001', '00000000-0000-0000-0000-00000000a001', 'platform_a', 'subscription', 'cpp:nogstin',
+        '2026-08-01', '2026-09-01', '2026-10-01',
+        'US', 'Other Country',
+        ROW('A Seller With No GSTIN On File',NULL,'seller',NULL,'Karnataka','29')::inv_party_input,
+        ROW('No-GSTIN Export Co',NULL,'buyer','unregistered','Other Country',NULL)::inv_party_input,
+        'export_lut', NULL, false, false,
+        'USD', '95.7245',
+        inv_money_to_decimal_string(inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','50.00')),
+        '2026-09-13',
+        ARRAY[ROW('Website build — export service','998314','1','50.00',0,NULL,false)::inv_line_input],
+        NULL, 'seed', '2026-09-13', 'issued');
+    RAISE NOTICE 'FAIL: expected ER070, got no error';
+  EXCEPTION WHEN SQLSTATE 'ER070' THEN RAISE NOTICE 'ok: ER070 raised (export invoice refused an India-scheme assumption with no seller GSTIN)';
+           WHEN OTHERS THEN RAISE NOTICE 'FAIL: expected ER070, got %', SQLSTATE;
+  END;
+END $$;
+
+\echo ''
+\echo '======== DONE — every ok_* above must be t; every negative shows an ok: ERxxx line ========'

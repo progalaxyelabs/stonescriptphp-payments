@@ -1,0 +1,72 @@
+-- stonescriptphp-invoice :: TEST — the step-2 now() DEFAULT transform.
+--   \i 039_test_now_defaults.psql
+-- Run with ON_ERROR_STOP=0. Proves a production caller may OMIT every
+-- [NOW-CANDIDATE] param/column and the module supplies now() itself — while the
+-- 001-038 suite above still pins EXPLICIT timestamps and stays deterministic.
+-- Each assertion prints ok_* = t.
+
+-- self-contained fixture (id/number chosen not to collide with 004-038)
+\set tenant_901 '''00000000-0000-0000-0000-000000000901'''
+\set platform   '''testplatform'''
+
+\echo ''
+\echo '======== ISSUE omitting p_created_at AND p_initial_status (both trailing defaults) ========'
+-- 23 positional args: ends at p_created_by. p_created_at -> now(); p_initial_status -> issued.
+SELECT inv_issue_invoice(
+    'INV-000901', :tenant_901, :platform, 'subscription', 'cpp:901:nowdefault',
+    '2026-08-01', '2026-09-01', '2026-10-01',
+    'IN', 'Karnataka',
+    ROW('ProGalaxy eLabs Pvt Ltd','29AAACX1234C1ZP','seller','regular','Karnataka','29')::inv_party_input,
+    ROW('Now-Default Co',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
+    'domestic', NULL, false, false,
+    'INR', NULL, NULL,
+    '2026-09-01',
+    ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
+    NULL, 'seed'
+) AS invoice_id;
+
+\echo '--- status defaulted to issued; created_at AND issued_at defaulted to now() (within a recent window) -> ok=t ---'
+SELECT (status='issued'
+        AND created_at BETWEEN now() - interval '2 minutes' AND now() + interval '2 minutes'
+        AND issued_at  BETWEEN now() - interval '2 minutes' AND now() + interval '2 minutes'
+        AND gross_total_minor=58882) AS ok_issue_now_default
+FROM inv_invoices WHERE invoice_number='INV-000901';
+
+\echo '--- the atomic outbox row was stamped from the now()-defaulted issued_at too -> ok=t ---'
+SELECT (count(*)=1
+        AND max(created_at) BETWEEN now() - interval '2 minutes' AND now() + interval '2 minutes') AS ok_outbox_now_default
+FROM inv_outbox
+WHERE invoice_id=(SELECT id FROM inv_invoices WHERE invoice_number='INV-000901')
+  AND direction='to_central';
+
+\echo ''
+\echo '======== TRANSITION issued->due omitting p_at (trailing default now()) ========'
+SELECT inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-000901'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000901'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000901'), 'due', 'cron'
+) AS new_status;
+\echo '--- transition succeeded with p_at omitted -> ok=t ---'
+SELECT (status='due') AS ok_transition_now_default
+FROM inv_invoices WHERE invoice_number='INV-000901';
+
+\echo ''
+\echo '======== chase list called with NO argument (p_as_of defaults to now()) ========'
+\echo '--- the still-unpaid INV-000901 appears in inv_crm_chase_list() -> ok=t ---'
+SELECT (count(*)=1) AS ok_chase_now_default
+FROM inv_crm_chase_list() WHERE invoice_number='INV-000901';
+
+\echo ''
+\echo '======== RECORD PAYMENT omitting p_created_at (trailing default now()) ========'
+-- captured_at is a genuine gateway business input -> still supplied explicitly.
+SELECT inv_record_payment((SELECT id FROM inv_invoices WHERE invoice_number='INV-000901'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000901'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000901'),
+    'razorpay','rzp_txn_901',58882,'INR','success','2026-10-05 10:00+05:30','gateway-webhook'
+) AS payment_id;
+\echo '--- invoice paid; payment.created_at defaulted to now(); paid_at kept the explicit gateway capture time -> ok=t ---'
+SELECT (i.status='paid'
+        AND i.paid_at='2026-10-05 10:00+05:30'                                   -- business input preserved
+        AND p.created_at BETWEEN now() - interval '2 minutes' AND now() + interval '2 minutes'  -- now-candidate defaulted
+       ) AS ok_payment_now_default
+FROM inv_invoices i
+JOIN inv_payments p ON p.invoice_id=i.id AND p.status='success'
+WHERE i.invoice_number='INV-000901';
+
+\echo ''
+\echo '======== DONE — every ok_* above must be t ========'

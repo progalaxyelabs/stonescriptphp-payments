@@ -1,0 +1,28 @@
+-- stonescriptphp-pay :: renew after expiry (gap), then renew early (seamless),
+-- verify active-in-between, and pull the purchase history across a range.
+-- Continues Dave from 010: his Jan ₹349 monthly lapsed on
+-- 2026-02-05 and was never renewed. He renews late, then renews again early.
+\set dave_tenant '''00000000-0000-0000-0000-000000000004'''
+\set platform    '''testplatform'''
+
+\echo '--- renew_subscription_pricing_plan(dave, 6, 2026-03-01, ...) — renewing LATE (lapsed 2026-02-05) ---'
+\echo '--- target is spp id=6 (the CURRENT ₹399 price) since ₹349 (id=4) is no longer sellable ---'
+SELECT * FROM renew_subscription_pricing_plan(:dave_tenant, :platform, 6, '2026-03-01', 'api');
+-- expect started_at = 2026-03-01 (the gap is real, not backdated to 2026-02-05)
+
+\echo '--- renew_subscription_pricing_plan(dave, 6, 2026-03-25, ...) — renewing EARLY (7 days before 2026-04-01 expiry) ---'
+SELECT * FROM renew_subscription_pricing_plan(:dave_tenant, :platform, 6, '2026-03-25', 'api');
+-- expect started_at = 2026-04-01, NOT 2026-03-25 — queues up, no days lost, no overlap
+
+\echo '--- get_active_pricing_plan(dave, 2026-03-28) — the March period still running; the queued April one has not started yet ---'
+SELECT * FROM get_active_pricing_plan(:dave_tenant, :platform, '2026-03-28');
+-- expect exactly 1 row: the March-started period (started_at=2026-03-01), NOT the April one
+
+\echo '--- get_active_pricing_plan(dave, 2026-04-01) — rollover instant: exactly the April period, no overlap ---'
+SELECT * FROM get_active_pricing_plan(:dave_tenant, :platform, '2026-04-01');
+
+\echo '--- get_customer_purchase_history(dave, 2026-01-01, 2026-06-01) — full ledger: Jan/₹349, Mar/₹399, Apr/₹399 ---'
+SELECT * FROM get_customer_purchase_history(:dave_tenant, :platform, '2026-01-01', '2026-06-01');
+
+\echo '--- renew_subscription_pricing_plan(dave, 4, ...) — targeting the OLD deactivated ₹349 row -> expect ER008 ---'
+SELECT * FROM renew_subscription_pricing_plan(:dave_tenant, :platform, 4, '2026-05-01', 'api');

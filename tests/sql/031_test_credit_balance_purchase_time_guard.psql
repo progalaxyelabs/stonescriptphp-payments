@@ -1,0 +1,61 @@
+-- stonescriptphp-pay :: REGRESSION for the 031 purchase-time FIFO guard on
+-- get_customer_credit_balance (the fix to the latent original-003 bug — see
+-- the note on src/Pricing/Schema/functions/003_12_get_customer_credit_balance.pgsql,
+-- restored at the 2026-09-22 merge). Runs right after 031's deployable .pgsql
+-- (same 031 prefix; the deployable .pgsql sorts before this .psql) so the
+-- guarded function body is already installed.
+--
+-- Fails LOUDLY (RAISE EXCEPTION) against the un-guarded 003 body.
+--
+-- Setup: batch A (5 credits, bought 2026-01-01, SHORT expiry 2026-02-01) and
+-- batch B (10 credits, bought 2026-03-01, expires 2026-09-01). A consumption of
+-- 8 credits is recorded at 2026-01-15 — a time when ONLY batch A existed.
+--
+--   Un-guarded 003: draws 5 from A, then 3 from B (bought 03-01, AFTER the
+--     01-15 consumption!) -> balance as of 2026-04-01 = 7  (WRONG)
+--   Guarded (031 fix): draws 5 from A only (B not yet purchased at 01-15) ->
+--     balance as of 2026-04-01 = 10  (CORRECT — the full, still-open batch B)
+--
+-- Self-contained seed (ids 931/932, unused elsewhere in the suite); tenant_id
+-- likewise a dedicated regression UUID unused elsewhere.
+-- ---------------------------------------------------------------------------
+\set regr_tenant '''00000000-0000-0000-0000-000000000931'''
+\set platform    '''testplatform'''
+
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, created_at, created_by)
+VALUES (931, 'Regression 5-pack', false, true, '2026-01-01', 'seed-031'),
+       (932, 'Regression 10-pack', false, true, '2026-03-01', 'seed-031');
+
+INSERT INTO one_time_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, credit_quantity, amount, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (931, 931, 1, 'month', false, true, 5,  4900, true, true, '2026-01-01', 'seed-031'),   -- batch A: 5 credits, 1-month expiry
+    (932, 932, 6, 'month', false, true, 10, 9900, true, true, '2026-03-01', 'seed-031');    -- batch B: 10 credits, 6-month expiry
+
+INSERT INTO customer_pricing_plans (tenant_id, platform_code, pricing_plan_id, one_time_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:regr_tenant, :platform, 931, 931, '2026-01-01', '2026-01-01', 'seed-031'),   -- batch A purchased 2026-01-01
+    (:regr_tenant, :platform, 932, 932, '2026-03-01', '2026-03-01', 'seed-031');   -- batch B purchased 2026-03-01
+
+-- Direct insert (bypasses consume_credits' own balance guard) to exercise the
+-- replay path: an 8-credit consumption recorded at 2026-01-15.
+INSERT INTO credit_consumptions (tenant_id, platform_code, consumed_at, credits_consumed, created_at, created_by)
+VALUES (:regr_tenant, :platform, '2026-01-15', 8, '2026-01-15', 'seed-031');
+
+\echo '--- REGRESSION: balance as of 2026-04-01 must be 10 (un-guarded 003 wrongly gives 7) ---'
+SELECT get_customer_credit_balance(:regr_tenant, :platform, '2026-04-01') AS balance_expect_10;
+
+-- NOTE: psql does NOT expand :variables inside a dollar-quoted block (same
+-- suppression rule as inside a single-quoted string) — the tenant/platform
+-- literals are hardcoded here rather than via :regr_tenant/:platform.
+DO $regr$
+DECLARE
+    v_bal BIGINT;
+BEGIN
+    v_bal := get_customer_credit_balance('00000000-0000-0000-0000-000000000931'::uuid, 'testplatform', '2026-04-01');
+    IF v_bal <> 10 THEN
+        RAISE EXCEPTION 'REGRESSION FAILED: purchase-time FIFO guard — expected balance 10, got % (a consumption drew from a batch bought after it)', v_bal;
+    END IF;
+    RAISE NOTICE 'REGRESSION PASS: purchase-time FIFO guard holds (balance = 10).';
+END;
+$regr$;

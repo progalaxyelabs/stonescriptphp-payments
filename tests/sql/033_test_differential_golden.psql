@@ -1,0 +1,1527 @@
+-- stonescriptphp-invoice :: DIFFERENTIAL golden test.
+-- Every expected value here was harvested as the OUTPUT of the reference
+-- implementation fed the SAME inputs as the SQL functions. This is the
+-- gold-standard differential proof: the pgsql path is proven equivalent by
+-- running the golden table through the functions, not by re-asserting hand-copied numbers.
+-- ON_ERROR_STOP=0: asserts LOG (never abort) into _inv_diff_results; the final SELECTs tally.
+
+DROP TABLE IF EXISTS _inv_diff_results;
+CREATE TABLE _inv_diff_results(id serial PRIMARY KEY, label text, passed boolean, actual text, expected text);
+
+CREATE OR REPLACE FUNCTION inv_assert_eq(p_label text, p_actual bigint, p_expected bigint) RETURNS void AS $$
+  INSERT INTO _inv_diff_results(label,passed,actual,expected)
+  VALUES(p_label, p_actual IS NOT DISTINCT FROM p_expected, p_actual::text, p_expected::text);
+$$ LANGUAGE sql;
+CREATE OR REPLACE FUNCTION inv_assert_text_eq(p_label text, p_actual text, p_expected text) RETURNS void AS $$
+  INSERT INTO _inv_diff_results(label,passed,actual,expected)
+  VALUES(p_label, p_actual IS NOT DISTINCT FROM p_expected, p_actual, p_expected);
+$$ LANGUAGE sql;
+CREATE OR REPLACE FUNCTION inv_assert_bool(p_label text, p_actual boolean, p_expected boolean) RETURNS void AS $$
+  INSERT INTO _inv_diff_results(label,passed,actual,expected)
+  VALUES(p_label, p_actual IS NOT DISTINCT FROM p_expected, p_actual::text, p_expected::text);
+$$ LANGUAGE sql;
+
+\echo '=== MoneyTest (Lib/Money.php) ==='
+SELECT inv_assert_eq('Money.toMinorUnits(100.00)', (inv_money_to_minor_units('100.00')), 10000);
+SELECT inv_assert_eq('Money.toMinorUnits(50.06)', (inv_money_to_minor_units('50.06')), 5006);
+SELECT inv_assert_eq('Money.toMinorUnits(0)', (inv_money_to_minor_units('0')), 0);
+SELECT inv_assert_eq('Money.toMinorUnits(0.00)', (inv_money_to_minor_units('0.00')), 0);
+SELECT inv_assert_eq('Money.toMinorUnits(-10.71)', (inv_money_to_minor_units('-10.71')), -1071);
+SELECT inv_assert_eq('Money.toMinorUnits(10.87)', (inv_money_to_minor_units('10.87')), 1087);
+SELECT inv_assert_eq('Money.toMinorUnits(1500)', (inv_money_to_minor_units('1500')), 150000);
+SELECT inv_assert_text_eq('Money.toDecimalString(10874)', (inv_money_to_decimal_string(10874)), '108.74');
+SELECT inv_assert_text_eq('Money.toDecimalString(5)', (inv_money_to_decimal_string(5)), '0.05');
+SELECT inv_assert_text_eq('Money.toDecimalString(-1071)', (inv_money_to_decimal_string(-1071)), '-10.71');
+SELECT inv_assert_text_eq('Money.toDecimalString(0)', (inv_money_to_decimal_string(0)), '0.00');
+SELECT inv_assert_eq('Money.halfUpDivide(217483,2)', (inv_money_half_up_divide(217483,2)), 108742);
+SELECT inv_assert_eq('Money.halfUpDivide(1210*500,10000)', (inv_money_half_up_divide(1210*500,10000)), 61);
+SELECT inv_assert_eq('Money.halfUpDivide(5006*1800,10000)', (inv_money_half_up_divide(5006*1800,10000)), 901);
+SELECT inv_assert_eq('Money.halfUpDivide(30,2)', (inv_money_half_up_divide(30,2)), 15);
+SELECT inv_assert_eq('Money.halfUpDivide(1500,10)', (inv_money_half_up_divide(1500,10)), 150);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0)', (inv_money_rate_to_basis_points(0)), 0);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0.0025)', (inv_money_rate_to_basis_points(0.0025)), 25);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0.03)', (inv_money_rate_to_basis_points(0.03)), 300);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0.05)', (inv_money_rate_to_basis_points(0.05)), 500);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0.12)', (inv_money_rate_to_basis_points(0.12)), 1200);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0.18)', (inv_money_rate_to_basis_points(0.18)), 1800);
+SELECT inv_assert_eq('Money.rateToBasisPoints(0.28)', (inv_money_rate_to_basis_points(0.28)), 2800);
+SELECT inv_assert_eq('Money.quantityToMilliUnits(1)', (inv_money_quantity_to_milli_units('1')), 1000);
+SELECT inv_assert_eq('Money.quantityToMilliUnits(2.5)', (inv_money_quantity_to_milli_units('2.5')), 2500);
+SELECT inv_assert_eq('Money.quantityToMilliUnits(0.333)', (inv_money_quantity_to_milli_units('0.333')), 333);
+SELECT inv_assert_text_eq('Money.qtyMilliToStr(1000)', (inv_money_quantity_milli_to_decimal_string(1000)), '1');
+SELECT inv_assert_text_eq('Money.qtyMilliToStr(2500)', (inv_money_quantity_milli_to_decimal_string(2500)), '2.5');
+SELECT inv_assert_text_eq('Money.qtyMilliToStr(333)', (inv_money_quantity_milli_to_decimal_string(333)), '0.333');
+SELECT inv_assert_text_eq('Money.qtyMilliToStr(250)', (inv_money_quantity_milli_to_decimal_string(250)), '0.25');
+SELECT inv_assert_text_eq('Money.assertPositiveDecimal(83.12)', (inv_money_assert_positive_decimal_string('83.12','fx_rate')), '83.12');
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_to_minor_units('10.875');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(10.875) precision',false,'no error','raise ER023');
+  EXCEPTION WHEN SQLSTATE 'ER023' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(10.875) precision',true,SQLSTATE,'ER023');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(10.875) precision',false,SQLSTATE,'ER023');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_to_minor_units('10.876');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(10.876) precision',false,'no error','raise ER023');
+  EXCEPTION WHEN SQLSTATE 'ER023' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(10.876) precision',true,SQLSTATE,'ER023');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(10.876) precision',false,SQLSTATE,'ER023');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_to_minor_units('not-a-number');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(not-a-number)',false,'no error','raise ER022');
+  EXCEPTION WHEN SQLSTATE 'ER022' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(not-a-number)',true,SQLSTATE,'ER022');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.toMinorUnits(not-a-number)',false,SQLSTATE,'ER022');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_half_up_divide(-100,2);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.halfUpDivide(-100,2)',false,'no error','raise ER024');
+  EXCEPTION WHEN SQLSTATE 'ER024' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.halfUpDivide(-100,2)',true,SQLSTATE,'ER024');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.halfUpDivide(-100,2)',false,SQLSTATE,'ER024');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_half_up_divide(100,0);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.halfUpDivide(100,0)',false,'no error','raise ER024');
+  EXCEPTION WHEN SQLSTATE 'ER024' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.halfUpDivide(100,0)',true,SQLSTATE,'ER024');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.halfUpDivide(100,0)',false,SQLSTATE,'ER024');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_quantity_to_milli_units('0.3333');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.quantity(0.3333) >3dp',false,'no error','raise ER025');
+  EXCEPTION WHEN SQLSTATE 'ER025' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.quantity(0.3333) >3dp',true,SQLSTATE,'ER025');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.quantity(0.3333) >3dp',false,SQLSTATE,'ER025');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_quantity_to_milli_units('NAN');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.quantity(NAN)',false,'no error','raise ER025');
+  EXCEPTION WHEN SQLSTATE 'ER025' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.quantity(NAN)',true,SQLSTATE,'ER025');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.quantity(NAN)',false,SQLSTATE,'ER025');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_assert_positive_decimal_string('0','fx_rate');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(0)',false,'no error','raise ER026');
+  EXCEPTION WHEN SQLSTATE 'ER026' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(0)',true,SQLSTATE,'ER026');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(0)',false,SQLSTATE,'ER026');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_assert_positive_decimal_string('-83.12','fx_rate');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(-83.12)',false,'no error','raise ER026');
+  EXCEPTION WHEN SQLSTATE 'ER026' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(-83.12)',true,SQLSTATE,'ER026');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(-83.12)',false,SQLSTATE,'ER026');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_money_assert_positive_decimal_string('NAN','fx_rate');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(NAN)',false,'no error','raise ER026');
+  EXCEPTION WHEN SQLSTATE 'ER026' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(NAN)',true,SQLSTATE,'ER026');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Money.assertPositiveDecimal(NAN)',false,SQLSTATE,'ER026');
+  END;
+END $D$;
+\echo '=== GstStateCodesTest (Support/GstStateCodes.php) ==='
+SELECT inv_assert_text_eq('GstStateCodes.resolve(29)', (inv_gst_resolve_state('29')), '29');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(27)', (inv_gst_resolve_state('27')), '27');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(00)', (inv_gst_resolve_state('00')), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.resolve(28)', (inv_gst_resolve_state('28')), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.resolve(92)', (inv_gst_resolve_state('92')), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.resolve(99)', (inv_gst_resolve_state('99')), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.resolve(Maharashtra)', (inv_gst_resolve_state('Maharashtra')), '27');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(karnataka)', (inv_gst_resolve_state('karnataka')), '29');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(Orissa)', (inv_gst_resolve_state('Orissa')), '21');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(Odisha)', (inv_gst_resolve_state('Odisha')), '21');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(Not A Real State)', (inv_gst_resolve_state('Not A Real State')), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.resolve(<empty>)', (inv_gst_resolve_state('')), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.resolve(96)', (inv_gst_resolve_state('96')), '96');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(97)', (inv_gst_resolve_state('97')), '97');
+SELECT inv_assert_text_eq('GstStateCodes.resolve(null)', (inv_gst_resolve_state(NULL)), NULL);
+SELECT inv_assert_text_eq('GstStateCodes.nameFor(96)', (inv_gst_state_name_for('96')), 'Other Country');
+SELECT inv_assert_text_eq('GstStateCodes.nameFor(97)', (inv_gst_state_name_for('97')), 'Other Territory');
+SELECT inv_assert_text_eq('GstStateCodes.nameFor(99)', (inv_gst_state_name_for('99')), NULL);
+\echo '=== NumberFormatterTest (Lib/NumberFormatter.php) ==='
+SELECT inv_assert_text_eq('Number.format(INV/,1,6)', (inv_number_format('INV/',1,6)), 'INV/000001');
+SELECT inv_assert_text_eq('Number.format(INV/26-27/,1,5)', (inv_number_format('INV/26-27/',1,5)), 'INV/26-27/00001');
+SELECT inv_assert_text_eq('Number.format(INV/26-27/,1,6)=16char', (inv_number_format('INV/26-27/',1,6)), 'INV/26-27/000001');
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_number_format('INV/26-27/',1,7);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.format(INV/26-27/,1,7) >16',false,'no error','raise ER040');
+  EXCEPTION WHEN SQLSTATE 'ER040' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.format(INV/26-27/,1,7) >16',true,SQLSTATE,'ER040');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.format(INV/26-27/,1,7) >16',false,SQLSTATE,'ER040');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_number_assert_lawful('INV#000001');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.assertLawful(INV#000001) charset',false,'no error','raise ER040');
+  EXCEPTION WHEN SQLSTATE 'ER040' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.assertLawful(INV#000001) charset',true,SQLSTATE,'ER040');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.assertLawful(INV#000001) charset',false,SQLSTATE,'ER040');
+  END;
+END $D$;
+DO $D$ BEGIN
+  PERFORM inv_number_assert_lawful('INV 26-27 001');
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.assertLawful(INV 26-27 001) ok',true,'no error','no error');
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.assertLawful(INV 26-27 001) ok',false,SQLSTATE,'no error');
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_number_format('INV/',0,6);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.format(INV/,0,6) seq',false,'no error','raise ER041');
+  EXCEPTION WHEN SQLSTATE 'ER041' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.format(INV/,0,6) seq',true,SQLSTATE,'ER041');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('Number.format(INV/,0,6) seq',false,SQLSTATE,'ER041');
+  END;
+END $D$;
+\echo '=== TaxEngine compute cases (Lib/TaxEngine.php) ==='
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','27AAAAA0000A1Z5','seller','regular','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Cloud Workspace','998315','1','1644.65',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('H1.taxable', r.taxable_value_minor, 164465);
+  PERFORM inv_assert_eq('H1.cgst', r.cgst_minor, 14802);
+  PERFORM inv_assert_eq('H1.sgst', r.sgst_minor, 14802);
+  PERFORM inv_assert_eq('H1.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('H1.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('H1.gross', r.gross_total_minor, 194069);
+  PERFORM inv_assert_text_eq('H1.gross_str', r.gross_total_str, '1940.69');
+  PERFORM inv_assert_text_eq('H1.taxable_str', r.taxable_value_str, '1644.65');
+  PERFORM inv_assert_text_eq('H1.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('H1.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('H1.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('H1.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('H1.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('H1.pos_code', r.place_of_supply_code, '27');
+  PERFORM inv_assert_text_eq('H1.pos_name', r.place_of_supply_name, 'Maharashtra');
+  PERFORM inv_assert_bool('H1.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('H1.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('H1.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('H1.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('H1.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('H1.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('H1.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('H1.seller_state_code', r.seller_state_code, '27');
+  PERFORM inv_assert_text_eq('H1.buyer_state_code', r.buyer_state_code, '27');
+  PERFORM inv_assert_eq('H1.L1.taxable', r.lines[1].taxable_value_minor, 164465);
+  PERFORM inv_assert_eq('H1.L1.cgst', r.lines[1].cgst_minor, 14802);
+  PERFORM inv_assert_eq('H1.L1.sgst', r.lines[1].sgst_minor, 14802);
+  PERFORM inv_assert_eq('H1.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('H1.L1.line_total', r.lines[1].line_total_minor, 194069);
+  PERFORM inv_assert_eq('H1.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('H1.L1.unit_price', r.lines[1].unit_price_minor, 164465);
+  PERFORM inv_assert_text_eq('H1.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('H1.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('H1.L1.taxable_str', r.lines[1].taxable_value_str, '1644.65');
+  PERFORM inv_assert_text_eq('H1.L1.line_total_str', r.lines[1].line_total_str, '1940.69');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','27AAAAA0000A1Z5','seller','regular','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Cloud Workspace','998315','1','12082.40',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('H2.taxable', r.taxable_value_minor, 1208240);
+  PERFORM inv_assert_eq('H2.cgst', r.cgst_minor, 108742);
+  PERFORM inv_assert_eq('H2.sgst', r.sgst_minor, 108742);
+  PERFORM inv_assert_eq('H2.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('H2.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('H2.gross', r.gross_total_minor, 1425724);
+  PERFORM inv_assert_text_eq('H2.gross_str', r.gross_total_str, '14257.24');
+  PERFORM inv_assert_text_eq('H2.taxable_str', r.taxable_value_str, '12082.40');
+  PERFORM inv_assert_text_eq('H2.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('H2.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('H2.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('H2.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('H2.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('H2.pos_code', r.place_of_supply_code, '27');
+  PERFORM inv_assert_text_eq('H2.pos_name', r.place_of_supply_name, 'Maharashtra');
+  PERFORM inv_assert_bool('H2.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('H2.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('H2.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('H2.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('H2.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('H2.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('H2.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('H2.seller_state_code', r.seller_state_code, '27');
+  PERFORM inv_assert_text_eq('H2.buyer_state_code', r.buyer_state_code, '27');
+  PERFORM inv_assert_eq('H2.L1.taxable', r.lines[1].taxable_value_minor, 1208240);
+  PERFORM inv_assert_eq('H2.L1.cgst', r.lines[1].cgst_minor, 108742);
+  PERFORM inv_assert_eq('H2.L1.sgst', r.lines[1].sgst_minor, 108742);
+  PERFORM inv_assert_eq('H2.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('H2.L1.line_total', r.lines[1].line_total_minor, 1425724);
+  PERFORM inv_assert_eq('H2.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('H2.L1.unit_price', r.lines[1].unit_price_minor, 1208240);
+  PERFORM inv_assert_text_eq('H2.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('H2.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('H2.L1.taxable_str', r.lines[1].taxable_value_str, '12082.40');
+  PERFORM inv_assert_text_eq('H2.L1.line_total_str', r.lines[1].line_total_str, '14257.24');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','1000.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('POS1_same_state.taxable', r.taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS1_same_state.cgst', r.cgst_minor, 9000);
+  PERFORM inv_assert_eq('POS1_same_state.sgst', r.sgst_minor, 9000);
+  PERFORM inv_assert_eq('POS1_same_state.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('POS1_same_state.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('POS1_same_state.gross', r.gross_total_minor, 118000);
+  PERFORM inv_assert_text_eq('POS1_same_state.gross_str', r.gross_total_str, '1180.00');
+  PERFORM inv_assert_text_eq('POS1_same_state.taxable_str', r.taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS1_same_state.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('POS1_same_state.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('POS1_same_state.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('POS1_same_state.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('POS1_same_state.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('POS1_same_state.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('POS1_same_state.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('POS1_same_state.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('POS1_same_state.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('POS1_same_state.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('POS1_same_state.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('POS1_same_state.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('POS1_same_state.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('POS1_same_state.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('POS1_same_state.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('POS1_same_state.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('POS1_same_state.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS1_same_state.L1.cgst', r.lines[1].cgst_minor, 9000);
+  PERFORM inv_assert_eq('POS1_same_state.L1.sgst', r.lines[1].sgst_minor, 9000);
+  PERFORM inv_assert_eq('POS1_same_state.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('POS1_same_state.L1.line_total', r.lines[1].line_total_minor, 118000);
+  PERFORM inv_assert_eq('POS1_same_state.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('POS1_same_state.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('POS1_same_state.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('POS1_same_state.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('POS1_same_state.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS1_same_state.L1.line_total_str', r.lines[1].line_total_str, '1180.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Delhi',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','1000.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('POS2_diff_state.taxable', r.taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS2_diff_state.cgst', r.cgst_minor, 0);
+  PERFORM inv_assert_eq('POS2_diff_state.sgst', r.sgst_minor, 0);
+  PERFORM inv_assert_eq('POS2_diff_state.igst', r.igst_minor, 18000);
+  PERFORM inv_assert_eq('POS2_diff_state.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('POS2_diff_state.gross', r.gross_total_minor, 118000);
+  PERFORM inv_assert_text_eq('POS2_diff_state.gross_str', r.gross_total_str, '1180.00');
+  PERFORM inv_assert_text_eq('POS2_diff_state.taxable_str', r.taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS2_diff_state.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('POS2_diff_state.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('POS2_diff_state.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('POS2_diff_state.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('POS2_diff_state.tax_treatment', r.tax_treatment, 'interstate');
+  PERFORM inv_assert_text_eq('POS2_diff_state.pos_code', r.place_of_supply_code, '07');
+  PERFORM inv_assert_text_eq('POS2_diff_state.pos_name', r.place_of_supply_name, 'Delhi');
+  PERFORM inv_assert_bool('POS2_diff_state.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('POS2_diff_state.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('POS2_diff_state.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('POS2_diff_state.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('POS2_diff_state.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('POS2_diff_state.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('POS2_diff_state.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('POS2_diff_state.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('POS2_diff_state.buyer_state_code', r.buyer_state_code, '07');
+  PERFORM inv_assert_eq('POS2_diff_state.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS2_diff_state.L1.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('POS2_diff_state.L1.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_eq('POS2_diff_state.L1.igst', r.lines[1].igst_minor, 18000);
+  PERFORM inv_assert_eq('POS2_diff_state.L1.line_total', r.lines[1].line_total_minor, 118000);
+  PERFORM inv_assert_eq('POS2_diff_state.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('POS2_diff_state.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('POS2_diff_state.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('POS2_diff_state.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('POS2_diff_state.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS2_diff_state.L1.line_total_str', r.lines[1].line_total_str, '1180.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Not A Real State',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','1000.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.taxable', r.taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.cgst', r.cgst_minor, 9000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.sgst', r.sgst_minor, 9000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.gross', r.gross_total_minor, 118000);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.gross_str', r.gross_total_str, '1180.00');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.taxable_str', r.taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('POS3_unresolvable_unregistered.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('POS3_unresolvable_unregistered.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.buyer_state_code', r.buyer_state_code, NULL);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.cgst', r.lines[1].cgst_minor, 9000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.sgst', r.lines[1].sgst_minor, 9000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.line_total', r.lines[1].line_total_minor, 118000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('POS3_unresolvable_unregistered.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS3_unresolvable_unregistered.L1.line_total_str', r.lines[1].line_total_str, '1180.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd','07AAAAA0000A1Z5','buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','1000.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.taxable', r.taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.cgst', r.cgst_minor, 0);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.sgst', r.sgst_minor, 0);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.igst', r.igst_minor, 18000);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.gross', r.gross_total_minor, 118000);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.gross_str', r.gross_total_str, '1180.00');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.taxable_str', r.taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.tax_treatment', r.tax_treatment, 'interstate');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.pos_code', r.place_of_supply_code, '07');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.pos_name', r.place_of_supply_name, 'Delhi');
+  PERFORM inv_assert_bool('POS6_gstin_state_governs.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('POS6_gstin_state_governs.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.buyer_eff_status', r.buyer_effective_registration_status, 'regular');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.buyer_state_code', r.buyer_state_code, '07');
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.igst', r.lines[1].igst_minor, 18000);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.line_total', r.lines[1].line_total_minor, 118000);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('POS6_gstin_state_governs.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS6_gstin_state_governs.L1.line_total_str', r.lines[1].line_total_str, '1180.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Outside India',NULL)::inv_party_input,'export_lut',NULL,false,false,'USD','83.12','83120.00',NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','1000.00',0,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('POS7_export_lut.taxable', r.taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS7_export_lut.cgst', r.cgst_minor, 0);
+  PERFORM inv_assert_eq('POS7_export_lut.sgst', r.sgst_minor, 0);
+  PERFORM inv_assert_eq('POS7_export_lut.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('POS7_export_lut.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('POS7_export_lut.gross', r.gross_total_minor, 100000);
+  PERFORM inv_assert_text_eq('POS7_export_lut.gross_str', r.gross_total_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS7_export_lut.taxable_str', r.taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS7_export_lut.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('POS7_export_lut.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('POS7_export_lut.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('POS7_export_lut.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('POS7_export_lut.tax_treatment', r.tax_treatment, 'export_lut');
+  PERFORM inv_assert_text_eq('POS7_export_lut.pos_code', r.place_of_supply_code, '96');
+  PERFORM inv_assert_text_eq('POS7_export_lut.pos_name', r.place_of_supply_name, 'Other Country');
+  PERFORM inv_assert_bool('POS7_export_lut.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('POS7_export_lut.currency', r.currency, 'USD');
+  PERFORM inv_assert_text_eq('POS7_export_lut.fx_rate', r.fx_rate, '83.12');
+  PERFORM inv_assert_eq('POS7_export_lut.amount_inr_minor', r.amount_inr_minor, 8312000);
+  PERFORM inv_assert_text_eq('POS7_export_lut.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('POS7_export_lut.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('POS7_export_lut.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('POS7_export_lut.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('POS7_export_lut.buyer_state_code', r.buyer_state_code, '96');
+  PERFORM inv_assert_eq('POS7_export_lut.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS7_export_lut.L1.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('POS7_export_lut.L1.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_eq('POS7_export_lut.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('POS7_export_lut.L1.line_total', r.lines[1].line_total_minor, 100000);
+  PERFORM inv_assert_eq('POS7_export_lut.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('POS7_export_lut.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('POS7_export_lut.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('POS7_export_lut.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('POS7_export_lut.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS7_export_lut.L1.line_total_str', r.lines[1].line_total_str, '1000.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Outside India',NULL)::inv_party_input,'export_with_igst',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','1000.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('POS9_export_with_igst.taxable', r.taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS9_export_with_igst.cgst', r.cgst_minor, 0);
+  PERFORM inv_assert_eq('POS9_export_with_igst.sgst', r.sgst_minor, 0);
+  PERFORM inv_assert_eq('POS9_export_with_igst.igst', r.igst_minor, 18000);
+  PERFORM inv_assert_eq('POS9_export_with_igst.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('POS9_export_with_igst.gross', r.gross_total_minor, 118000);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.gross_str', r.gross_total_str, '1180.00');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.taxable_str', r.taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.tax_treatment', r.tax_treatment, 'export_with_igst');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.pos_code', r.place_of_supply_code, '96');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.pos_name', r.place_of_supply_name, 'Other Country');
+  PERFORM inv_assert_bool('POS9_export_with_igst.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('POS9_export_with_igst.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('POS9_export_with_igst.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.buyer_state_code', r.buyer_state_code, '96');
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.igst', r.lines[1].igst_minor, 18000);
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.line_total', r.lines[1].line_total_minor, 118000);
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('POS9_export_with_igst.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('POS9_export_with_igst.L1.line_total_str', r.lines[1].line_total_str, '1180.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,true,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('MRP-labelled item','998315','1','118.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('IP1_118.taxable', r.taxable_value_minor, 10000);
+  PERFORM inv_assert_eq('IP1_118.cgst', r.cgst_minor, 900);
+  PERFORM inv_assert_eq('IP1_118.sgst', r.sgst_minor, 900);
+  PERFORM inv_assert_eq('IP1_118.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('IP1_118.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('IP1_118.gross', r.gross_total_minor, 11800);
+  PERFORM inv_assert_text_eq('IP1_118.gross_str', r.gross_total_str, '118.00');
+  PERFORM inv_assert_text_eq('IP1_118.taxable_str', r.taxable_value_str, '100.00');
+  PERFORM inv_assert_text_eq('IP1_118.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('IP1_118.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('IP1_118.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('IP1_118.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('IP1_118.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('IP1_118.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('IP1_118.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('IP1_118.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('IP1_118.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('IP1_118.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('IP1_118.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('IP1_118.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('IP1_118.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('IP1_118.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('IP1_118.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('IP1_118.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('IP1_118.L1.taxable', r.lines[1].taxable_value_minor, 10000);
+  PERFORM inv_assert_eq('IP1_118.L1.cgst', r.lines[1].cgst_minor, 900);
+  PERFORM inv_assert_eq('IP1_118.L1.sgst', r.lines[1].sgst_minor, 900);
+  PERFORM inv_assert_eq('IP1_118.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('IP1_118.L1.line_total', r.lines[1].line_total_minor, 11800);
+  PERFORM inv_assert_eq('IP1_118.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('IP1_118.L1.unit_price', r.lines[1].unit_price_minor, 11800);
+  PERFORM inv_assert_text_eq('IP1_118.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP1_118.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('IP1_118.L1.taxable_str', r.lines[1].taxable_value_str, '100.00');
+  PERFORM inv_assert_text_eq('IP1_118.L1.line_total_str', r.lines[1].line_total_str, '118.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,true,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('MRP-labelled item','998315','3','100.00',0.12,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.taxable', r.taxable_value_minor, 26786);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.cgst', r.cgst_minor, 1607);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.sgst', r.sgst_minor, 1607);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.gross', r.gross_total_minor, 30000);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.gross_str', r.gross_total_str, '300.00');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.taxable_str', r.taxable_value_str, '267.86');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('IP2_qty3_12pct.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('IP2_qty3_12pct.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.taxable', r.lines[1].taxable_value_minor, 26786);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.cgst', r.lines[1].cgst_minor, 1607);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.sgst', r.lines[1].sgst_minor, 1607);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.line_total', r.lines[1].line_total_minor, 30000);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.qty_milli', r.lines[1].quantity_milli, 3000);
+  PERFORM inv_assert_eq('IP2_qty3_12pct.L1.unit_price', r.lines[1].unit_price_minor, 10000);
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.L1.qty_str', r.lines[1].quantity_str, '3');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.L1.taxable_str', r.lines[1].taxable_value_str, '267.86');
+  PERFORM inv_assert_text_eq('IP2_qty3_12pct.L1.line_total_str', r.lines[1].line_total_str, '300.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,true,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Strip of tablets, MRP 99.99','998315','1','99.99',0.12,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('IP3_9999.taxable', r.taxable_value_minor, 8927);
+  PERFORM inv_assert_eq('IP3_9999.cgst', r.cgst_minor, 536);
+  PERFORM inv_assert_eq('IP3_9999.sgst', r.sgst_minor, 536);
+  PERFORM inv_assert_eq('IP3_9999.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('IP3_9999.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('IP3_9999.gross', r.gross_total_minor, 9999);
+  PERFORM inv_assert_text_eq('IP3_9999.gross_str', r.gross_total_str, '99.99');
+  PERFORM inv_assert_text_eq('IP3_9999.taxable_str', r.taxable_value_str, '89.27');
+  PERFORM inv_assert_text_eq('IP3_9999.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('IP3_9999.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('IP3_9999.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('IP3_9999.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('IP3_9999.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('IP3_9999.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('IP3_9999.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('IP3_9999.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('IP3_9999.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('IP3_9999.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('IP3_9999.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('IP3_9999.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('IP3_9999.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('IP3_9999.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('IP3_9999.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('IP3_9999.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('IP3_9999.L1.taxable', r.lines[1].taxable_value_minor, 8927);
+  PERFORM inv_assert_eq('IP3_9999.L1.cgst', r.lines[1].cgst_minor, 536);
+  PERFORM inv_assert_eq('IP3_9999.L1.sgst', r.lines[1].sgst_minor, 536);
+  PERFORM inv_assert_eq('IP3_9999.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('IP3_9999.L1.line_total', r.lines[1].line_total_minor, 9999);
+  PERFORM inv_assert_eq('IP3_9999.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('IP3_9999.L1.unit_price', r.lines[1].unit_price_minor, 9999);
+  PERFORM inv_assert_text_eq('IP3_9999.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP3_9999.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('IP3_9999.L1.taxable_str', r.lines[1].taxable_value_str, '89.27');
+  PERFORM inv_assert_text_eq('IP3_9999.L1.line_total_str', r.lines[1].line_total_str, '99.99');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,true,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Item A','998315','1','99.99',0.12,'0',false)::inv_line_input,ROW('Item B','998315','1','49.50',0.18,'0',false)::inv_line_input,ROW('Item C','998315','1','118.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('IP4_multiline.taxable', r.taxable_value_minor, 23121);
+  PERFORM inv_assert_eq('IP4_multiline.cgst', r.cgst_minor, 1814);
+  PERFORM inv_assert_eq('IP4_multiline.sgst', r.sgst_minor, 1814);
+  PERFORM inv_assert_eq('IP4_multiline.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('IP4_multiline.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('IP4_multiline.gross', r.gross_total_minor, 26749);
+  PERFORM inv_assert_text_eq('IP4_multiline.gross_str', r.gross_total_str, '267.49');
+  PERFORM inv_assert_text_eq('IP4_multiline.taxable_str', r.taxable_value_str, '231.21');
+  PERFORM inv_assert_text_eq('IP4_multiline.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('IP4_multiline.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('IP4_multiline.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('IP4_multiline.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('IP4_multiline.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('IP4_multiline.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('IP4_multiline.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('IP4_multiline.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('IP4_multiline.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('IP4_multiline.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('IP4_multiline.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('IP4_multiline.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('IP4_multiline.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('IP4_multiline.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('IP4_multiline.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('IP4_multiline.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('IP4_multiline.L1.taxable', r.lines[1].taxable_value_minor, 8927);
+  PERFORM inv_assert_eq('IP4_multiline.L1.cgst', r.lines[1].cgst_minor, 536);
+  PERFORM inv_assert_eq('IP4_multiline.L1.sgst', r.lines[1].sgst_minor, 536);
+  PERFORM inv_assert_eq('IP4_multiline.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('IP4_multiline.L1.line_total', r.lines[1].line_total_minor, 9999);
+  PERFORM inv_assert_eq('IP4_multiline.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('IP4_multiline.L1.unit_price', r.lines[1].unit_price_minor, 9999);
+  PERFORM inv_assert_text_eq('IP4_multiline.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP4_multiline.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('IP4_multiline.L1.taxable_str', r.lines[1].taxable_value_str, '89.27');
+  PERFORM inv_assert_text_eq('IP4_multiline.L1.line_total_str', r.lines[1].line_total_str, '99.99');
+  PERFORM inv_assert_eq('IP4_multiline.L2.taxable', r.lines[2].taxable_value_minor, 4194);
+  PERFORM inv_assert_eq('IP4_multiline.L2.cgst', r.lines[2].cgst_minor, 378);
+  PERFORM inv_assert_eq('IP4_multiline.L2.sgst', r.lines[2].sgst_minor, 378);
+  PERFORM inv_assert_eq('IP4_multiline.L2.igst', r.lines[2].igst_minor, 0);
+  PERFORM inv_assert_eq('IP4_multiline.L2.line_total', r.lines[2].line_total_minor, 4950);
+  PERFORM inv_assert_eq('IP4_multiline.L2.qty_milli', r.lines[2].quantity_milli, 1000);
+  PERFORM inv_assert_eq('IP4_multiline.L2.unit_price', r.lines[2].unit_price_minor, 4950);
+  PERFORM inv_assert_text_eq('IP4_multiline.L2.hsn_sac', r.lines[2].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP4_multiline.L2.qty_str', r.lines[2].quantity_str, '1');
+  PERFORM inv_assert_text_eq('IP4_multiline.L2.taxable_str', r.lines[2].taxable_value_str, '41.94');
+  PERFORM inv_assert_text_eq('IP4_multiline.L2.line_total_str', r.lines[2].line_total_str, '49.50');
+  PERFORM inv_assert_eq('IP4_multiline.L3.taxable', r.lines[3].taxable_value_minor, 10000);
+  PERFORM inv_assert_eq('IP4_multiline.L3.cgst', r.lines[3].cgst_minor, 900);
+  PERFORM inv_assert_eq('IP4_multiline.L3.sgst', r.lines[3].sgst_minor, 900);
+  PERFORM inv_assert_eq('IP4_multiline.L3.igst', r.lines[3].igst_minor, 0);
+  PERFORM inv_assert_eq('IP4_multiline.L3.line_total', r.lines[3].line_total_minor, 11800);
+  PERFORM inv_assert_eq('IP4_multiline.L3.qty_milli', r.lines[3].quantity_milli, 1000);
+  PERFORM inv_assert_eq('IP4_multiline.L3.unit_price', r.lines[3].unit_price_minor, 11800);
+  PERFORM inv_assert_text_eq('IP4_multiline.L3.hsn_sac', r.lines[3].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP4_multiline.L3.qty_str', r.lines[3].quantity_str, '1');
+  PERFORM inv_assert_text_eq('IP4_multiline.L3.taxable_str', r.lines[3].taxable_value_str, '100.00');
+  PERFORM inv_assert_text_eq('IP4_multiline.L3.line_total_str', r.lines[3].line_total_str, '118.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Delhi',NULL)::inv_party_input,'domestic',NULL,true,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Interstate strip, MRP 99.99','998315','1','99.99',0.12,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('IP5_9999_interstate.taxable', r.taxable_value_minor, 8928);
+  PERFORM inv_assert_eq('IP5_9999_interstate.cgst', r.cgst_minor, 0);
+  PERFORM inv_assert_eq('IP5_9999_interstate.sgst', r.sgst_minor, 0);
+  PERFORM inv_assert_eq('IP5_9999_interstate.igst', r.igst_minor, 1071);
+  PERFORM inv_assert_eq('IP5_9999_interstate.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('IP5_9999_interstate.gross', r.gross_total_minor, 9999);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.gross_str', r.gross_total_str, '99.99');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.taxable_str', r.taxable_value_str, '89.28');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.tax_treatment', r.tax_treatment, 'interstate');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.pos_code', r.place_of_supply_code, '07');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.pos_name', r.place_of_supply_name, 'Delhi');
+  PERFORM inv_assert_bool('IP5_9999_interstate.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('IP5_9999_interstate.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('IP5_9999_interstate.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.buyer_state_code', r.buyer_state_code, '07');
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.taxable', r.lines[1].taxable_value_minor, 8928);
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.igst', r.lines[1].igst_minor, 1071);
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.line_total', r.lines[1].line_total_minor, 9999);
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('IP5_9999_interstate.L1.unit_price', r.lines[1].unit_price_minor, 9999);
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.L1.taxable_str', r.lines[1].taxable_value_str, '89.28');
+  PERFORM inv_assert_text_eq('IP5_9999_interstate.L1.line_total_str', r.lines[1].line_total_str, '99.99');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','50.06',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('R1_5006.taxable', r.taxable_value_minor, 5006);
+  PERFORM inv_assert_eq('R1_5006.cgst', r.cgst_minor, 451);
+  PERFORM inv_assert_eq('R1_5006.sgst', r.sgst_minor, 451);
+  PERFORM inv_assert_eq('R1_5006.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('R1_5006.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('R1_5006.gross', r.gross_total_minor, 5908);
+  PERFORM inv_assert_text_eq('R1_5006.gross_str', r.gross_total_str, '59.08');
+  PERFORM inv_assert_text_eq('R1_5006.taxable_str', r.taxable_value_str, '50.06');
+  PERFORM inv_assert_text_eq('R1_5006.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('R1_5006.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('R1_5006.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('R1_5006.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('R1_5006.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('R1_5006.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('R1_5006.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('R1_5006.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('R1_5006.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('R1_5006.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('R1_5006.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('R1_5006.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('R1_5006.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('R1_5006.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('R1_5006.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('R1_5006.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('R1_5006.L1.taxable', r.lines[1].taxable_value_minor, 5006);
+  PERFORM inv_assert_eq('R1_5006.L1.cgst', r.lines[1].cgst_minor, 451);
+  PERFORM inv_assert_eq('R1_5006.L1.sgst', r.lines[1].sgst_minor, 451);
+  PERFORM inv_assert_eq('R1_5006.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('R1_5006.L1.line_total', r.lines[1].line_total_minor, 5908);
+  PERFORM inv_assert_eq('R1_5006.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R1_5006.L1.unit_price', r.lines[1].unit_price_minor, 5006);
+  PERFORM inv_assert_text_eq('R1_5006.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R1_5006.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R1_5006.L1.taxable_str', r.lines[1].taxable_value_str, '50.06');
+  PERFORM inv_assert_text_eq('R1_5006.L1.line_total_str', r.lines[1].line_total_str, '59.08');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','12.10',0.05,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('R3_1210_5pct.taxable', r.taxable_value_minor, 1210);
+  PERFORM inv_assert_eq('R3_1210_5pct.cgst', r.cgst_minor, 31);
+  PERFORM inv_assert_eq('R3_1210_5pct.sgst', r.sgst_minor, 31);
+  PERFORM inv_assert_eq('R3_1210_5pct.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('R3_1210_5pct.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('R3_1210_5pct.gross', r.gross_total_minor, 1272);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.gross_str', r.gross_total_str, '12.72');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.taxable_str', r.taxable_value_str, '12.10');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('R3_1210_5pct.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('R3_1210_5pct.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('R3_1210_5pct.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.taxable', r.lines[1].taxable_value_minor, 1210);
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.cgst', r.lines[1].cgst_minor, 31);
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.sgst', r.lines[1].sgst_minor, 31);
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.line_total', r.lines[1].line_total_minor, 1272);
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R3_1210_5pct.L1.unit_price', r.lines[1].unit_price_minor, 1210);
+  PERFORM inv_assert_text_eq('R3_1210_5pct.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.L1.taxable_str', r.lines[1].taxable_value_str, '12.10');
+  PERFORM inv_assert_text_eq('R3_1210_5pct.L1.line_total_str', r.lines[1].line_total_str, '12.72');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','5.90',0.12,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('R4_590_12pct.taxable', r.taxable_value_minor, 590);
+  PERFORM inv_assert_eq('R4_590_12pct.cgst', r.cgst_minor, 36);
+  PERFORM inv_assert_eq('R4_590_12pct.sgst', r.sgst_minor, 36);
+  PERFORM inv_assert_eq('R4_590_12pct.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('R4_590_12pct.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('R4_590_12pct.gross', r.gross_total_minor, 662);
+  PERFORM inv_assert_text_eq('R4_590_12pct.gross_str', r.gross_total_str, '6.62');
+  PERFORM inv_assert_text_eq('R4_590_12pct.taxable_str', r.taxable_value_str, '5.90');
+  PERFORM inv_assert_text_eq('R4_590_12pct.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('R4_590_12pct.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('R4_590_12pct.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('R4_590_12pct.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('R4_590_12pct.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('R4_590_12pct.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('R4_590_12pct.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('R4_590_12pct.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('R4_590_12pct.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('R4_590_12pct.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('R4_590_12pct.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('R4_590_12pct.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('R4_590_12pct.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('R4_590_12pct.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('R4_590_12pct.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('R4_590_12pct.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('R4_590_12pct.L1.taxable', r.lines[1].taxable_value_minor, 590);
+  PERFORM inv_assert_eq('R4_590_12pct.L1.cgst', r.lines[1].cgst_minor, 36);
+  PERFORM inv_assert_eq('R4_590_12pct.L1.sgst', r.lines[1].sgst_minor, 36);
+  PERFORM inv_assert_eq('R4_590_12pct.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('R4_590_12pct.L1.line_total', r.lines[1].line_total_minor, 662);
+  PERFORM inv_assert_eq('R4_590_12pct.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R4_590_12pct.L1.unit_price', r.lines[1].unit_price_minor, 590);
+  PERFORM inv_assert_text_eq('R4_590_12pct.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R4_590_12pct.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R4_590_12pct.L1.taxable_str', r.lines[1].taxable_value_str, '5.90');
+  PERFORM inv_assert_text_eq('R4_590_12pct.L1.line_total_str', r.lines[1].line_total_str, '6.62');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,true,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','50.06',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('R5_roundoff.taxable', r.taxable_value_minor, 5006);
+  PERFORM inv_assert_eq('R5_roundoff.cgst', r.cgst_minor, 451);
+  PERFORM inv_assert_eq('R5_roundoff.sgst', r.sgst_minor, 451);
+  PERFORM inv_assert_eq('R5_roundoff.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('R5_roundoff.round_off', r.round_off_minor, -8);
+  PERFORM inv_assert_eq('R5_roundoff.gross', r.gross_total_minor, 5900);
+  PERFORM inv_assert_text_eq('R5_roundoff.gross_str', r.gross_total_str, '59.00');
+  PERFORM inv_assert_text_eq('R5_roundoff.taxable_str', r.taxable_value_str, '50.06');
+  PERFORM inv_assert_text_eq('R5_roundoff.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('R5_roundoff.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('R5_roundoff.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('R5_roundoff.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('R5_roundoff.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('R5_roundoff.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('R5_roundoff.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('R5_roundoff.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('R5_roundoff.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('R5_roundoff.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('R5_roundoff.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('R5_roundoff.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('R5_roundoff.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('R5_roundoff.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('R5_roundoff.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('R5_roundoff.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('R5_roundoff.L1.taxable', r.lines[1].taxable_value_minor, 5006);
+  PERFORM inv_assert_eq('R5_roundoff.L1.cgst', r.lines[1].cgst_minor, 451);
+  PERFORM inv_assert_eq('R5_roundoff.L1.sgst', r.lines[1].sgst_minor, 451);
+  PERFORM inv_assert_eq('R5_roundoff.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('R5_roundoff.L1.line_total', r.lines[1].line_total_minor, 5908);
+  PERFORM inv_assert_eq('R5_roundoff.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R5_roundoff.L1.unit_price', r.lines[1].unit_price_minor, 5006);
+  PERFORM inv_assert_text_eq('R5_roundoff.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R5_roundoff.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R5_roundoff.L1.taxable_str', r.lines[1].taxable_value_str, '50.06');
+  PERFORM inv_assert_text_eq('R5_roundoff.L1.line_total_str', r.lines[1].line_total_str, '59.08');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,true,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','174.40',0,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('R6_roundoff_neg.taxable', r.taxable_value_minor, 17440);
+  PERFORM inv_assert_eq('R6_roundoff_neg.cgst', r.cgst_minor, 0);
+  PERFORM inv_assert_eq('R6_roundoff_neg.sgst', r.sgst_minor, 0);
+  PERFORM inv_assert_eq('R6_roundoff_neg.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('R6_roundoff_neg.round_off', r.round_off_minor, -40);
+  PERFORM inv_assert_eq('R6_roundoff_neg.gross', r.gross_total_minor, 17400);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.gross_str', r.gross_total_str, '174.00');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.taxable_str', r.taxable_value_str, '174.40');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('R6_roundoff_neg.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('R6_roundoff_neg.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('R6_roundoff_neg.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.taxable', r.lines[1].taxable_value_minor, 17440);
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.line_total', r.lines[1].line_total_minor, 17440);
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R6_roundoff_neg.L1.unit_price', r.lines[1].unit_price_minor, 17440);
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.L1.taxable_str', r.lines[1].taxable_value_str, '174.40');
+  PERFORM inv_assert_text_eq('R6_roundoff_neg.L1.line_total_str', r.lines[1].line_total_str, '174.40');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','50.06',0.18,'0',false)::inv_line_input,ROW('Example Service','998315','1','33.33',0.12,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.taxable', r.taxable_value_minor, 8339);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.cgst', r.cgst_minor, 651);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.sgst', r.sgst_minor, 651);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.gross', r.gross_total_minor, 9641);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.gross_str', r.gross_total_str, '96.41');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.taxable_str', r.taxable_value_str, '83.39');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('R7_multiline_oddpaisa.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('R7_multiline_oddpaisa.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.taxable', r.lines[1].taxable_value_minor, 5006);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.cgst', r.lines[1].cgst_minor, 451);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.sgst', r.lines[1].sgst_minor, 451);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.line_total', r.lines[1].line_total_minor, 5908);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L1.unit_price', r.lines[1].unit_price_minor, 5006);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L1.taxable_str', r.lines[1].taxable_value_str, '50.06');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L1.line_total_str', r.lines[1].line_total_str, '59.08');
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.taxable', r.lines[2].taxable_value_minor, 3333);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.cgst', r.lines[2].cgst_minor, 200);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.sgst', r.lines[2].sgst_minor, 200);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.igst', r.lines[2].igst_minor, 0);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.line_total', r.lines[2].line_total_minor, 3733);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.qty_milli', r.lines[2].quantity_milli, 1000);
+  PERFORM inv_assert_eq('R7_multiline_oddpaisa.L2.unit_price', r.lines[2].unit_price_minor, 3333);
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L2.hsn_sac', r.lines[2].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L2.qty_str', r.lines[2].quantity_str, '1');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L2.taxable_str', r.lines[2].taxable_value_str, '33.33');
+  PERFORM inv_assert_text_eq('R7_multiline_oddpaisa.L2.line_total_str', r.lines[2].line_total_str, '37.33');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Line A','998315','1','1000.00',0.18,'0',false)::inv_line_input,ROW('Line B','998315','1','500.00',0.12,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('ML1.taxable', r.taxable_value_minor, 150000);
+  PERFORM inv_assert_eq('ML1.cgst', r.cgst_minor, 12000);
+  PERFORM inv_assert_eq('ML1.sgst', r.sgst_minor, 12000);
+  PERFORM inv_assert_eq('ML1.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('ML1.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('ML1.gross', r.gross_total_minor, 174000);
+  PERFORM inv_assert_text_eq('ML1.gross_str', r.gross_total_str, '1740.00');
+  PERFORM inv_assert_text_eq('ML1.taxable_str', r.taxable_value_str, '1500.00');
+  PERFORM inv_assert_text_eq('ML1.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('ML1.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('ML1.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('ML1.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('ML1.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('ML1.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('ML1.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('ML1.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('ML1.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('ML1.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('ML1.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('ML1.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('ML1.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('ML1.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('ML1.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('ML1.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('ML1.L1.taxable', r.lines[1].taxable_value_minor, 100000);
+  PERFORM inv_assert_eq('ML1.L1.cgst', r.lines[1].cgst_minor, 9000);
+  PERFORM inv_assert_eq('ML1.L1.sgst', r.lines[1].sgst_minor, 9000);
+  PERFORM inv_assert_eq('ML1.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('ML1.L1.line_total', r.lines[1].line_total_minor, 118000);
+  PERFORM inv_assert_eq('ML1.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('ML1.L1.unit_price', r.lines[1].unit_price_minor, 100000);
+  PERFORM inv_assert_text_eq('ML1.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('ML1.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('ML1.L1.taxable_str', r.lines[1].taxable_value_str, '1000.00');
+  PERFORM inv_assert_text_eq('ML1.L1.line_total_str', r.lines[1].line_total_str, '1180.00');
+  PERFORM inv_assert_eq('ML1.L2.taxable', r.lines[2].taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('ML1.L2.cgst', r.lines[2].cgst_minor, 3000);
+  PERFORM inv_assert_eq('ML1.L2.sgst', r.lines[2].sgst_minor, 3000);
+  PERFORM inv_assert_eq('ML1.L2.igst', r.lines[2].igst_minor, 0);
+  PERFORM inv_assert_eq('ML1.L2.line_total', r.lines[2].line_total_minor, 56000);
+  PERFORM inv_assert_eq('ML1.L2.qty_milli', r.lines[2].quantity_milli, 1000);
+  PERFORM inv_assert_eq('ML1.L2.unit_price', r.lines[2].unit_price_minor, 50000);
+  PERFORM inv_assert_text_eq('ML1.L2.hsn_sac', r.lines[2].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('ML1.L2.qty_str', r.lines[2].quantity_str, '1');
+  PERFORM inv_assert_text_eq('ML1.L2.taxable_str', r.lines[2].taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('ML1.L2.line_total_str', r.lines[2].line_total_str, '560.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Composition Store','27AAAAA0000B1Z5','seller','composition','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,'BOS/000001','2026-09-11'::timestamptz,ARRAY[ROW('Composition-scheme sale','998315','1','500.00',0,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('BOS1_composition.taxable', r.taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('BOS1_composition.cgst', r.cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.sgst', r.sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.igst', r.igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.gross', r.gross_total_minor, 50000);
+  PERFORM inv_assert_text_eq('BOS1_composition.gross_str', r.gross_total_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS1_composition.taxable_str', r.taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS1_composition.document_type', r.document_type, 'bill_of_supply');
+  PERFORM inv_assert_text_eq('BOS1_composition.document_title', r.document_title, 'Bill of Supply');
+  PERFORM inv_assert_text_eq('BOS1_composition.statutory_legend', r.statutory_legend, 'Composition taxable person, not eligible to collect tax on supplies');
+  PERFORM inv_assert_text_eq('BOS1_composition.no_itc_note', r.no_itc_note, 'No tax has been charged on this document. No input tax credit is available against it.');
+  PERFORM inv_assert_text_eq('BOS1_composition.tax_treatment', r.tax_treatment, 'no_tax');
+  PERFORM inv_assert_text_eq('BOS1_composition.pos_code', r.place_of_supply_code, '27');
+  PERFORM inv_assert_text_eq('BOS1_composition.pos_name', r.place_of_supply_name, 'Maharashtra');
+  PERFORM inv_assert_bool('BOS1_composition.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('BOS1_composition.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('BOS1_composition.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('BOS1_composition.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('BOS1_composition.invoice_number', r.invoice_number, 'BOS/000001');
+  PERFORM inv_assert_bool('BOS1_composition.numbered', r.numbered, true);
+  PERFORM inv_assert_text_eq('BOS1_composition.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('BOS1_composition.seller_state_code', r.seller_state_code, '27');
+  PERFORM inv_assert_text_eq('BOS1_composition.buyer_state_code', r.buyer_state_code, '27');
+  PERFORM inv_assert_eq('BOS1_composition.L1.taxable', r.lines[1].taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('BOS1_composition.L1.cgst', r.lines[1].cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.L1.sgst', r.lines[1].sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.L1.igst', r.lines[1].igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS1_composition.L1.line_total', r.lines[1].line_total_minor, 50000);
+  PERFORM inv_assert_eq('BOS1_composition.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('BOS1_composition.L1.unit_price', r.lines[1].unit_price_minor, 50000);
+  PERFORM inv_assert_text_eq('BOS1_composition.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('BOS1_composition.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('BOS1_composition.L1.taxable_str', r.lines[1].taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS1_composition.L1.line_total_str', r.lines[1].line_total_str, '500.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Neighbourhood Store',NULL,'seller','unregistered','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','200.00',0,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('BOS2_unregistered.taxable', r.taxable_value_minor, 20000);
+  PERFORM inv_assert_eq('BOS2_unregistered.cgst', r.cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.sgst', r.sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.igst', r.igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.gross', r.gross_total_minor, 20000);
+  PERFORM inv_assert_text_eq('BOS2_unregistered.gross_str', r.gross_total_str, '200.00');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.taxable_str', r.taxable_value_str, '200.00');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.document_type', r.document_type, 'bill_of_supply');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.document_title', r.document_title, 'Invoice');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('BOS2_unregistered.no_itc_note', r.no_itc_note, 'No tax has been charged on this document. No input tax credit is available against it.');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.tax_treatment', r.tax_treatment, 'no_tax');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.pos_code', r.place_of_supply_code, '27');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.pos_name', r.place_of_supply_name, 'Maharashtra');
+  PERFORM inv_assert_bool('BOS2_unregistered.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('BOS2_unregistered.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('BOS2_unregistered.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('BOS2_unregistered.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('BOS2_unregistered.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('BOS2_unregistered.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.seller_state_code', r.seller_state_code, '27');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.buyer_state_code', r.buyer_state_code, '27');
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.taxable', r.lines[1].taxable_value_minor, 20000);
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.cgst', r.lines[1].cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.sgst', r.lines[1].sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.igst', r.lines[1].igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.line_total', r.lines[1].line_total_minor, 20000);
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('BOS2_unregistered.L1.unit_price', r.lines[1].unit_price_minor, 20000);
+  PERFORM inv_assert_text_eq('BOS2_unregistered.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.L1.taxable_str', r.lines[1].taxable_value_str, '200.00');
+  PERFORM inv_assert_text_eq('BOS2_unregistered.L1.line_total_str', r.lines[1].line_total_str, '200.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','27AAAAA0000A1Z5','seller','regular','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic','bill_of_supply',false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','500.00',0,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.taxable', r.taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.cgst', r.cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.sgst', r.sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.igst', r.igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.gross', r.gross_total_minor, 50000);
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.gross_str', r.gross_total_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.taxable_str', r.taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.document_type', r.document_type, 'bill_of_supply');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.document_title', r.document_title, 'Bill of Supply');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.no_itc_note', r.no_itc_note, 'No tax has been charged on this document. No input tax credit is available against it.');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.tax_treatment', r.tax_treatment, 'no_tax');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.pos_code', r.place_of_supply_code, '27');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.pos_name', r.place_of_supply_name, 'Maharashtra');
+  PERFORM inv_assert_bool('BOS10_regular_exempt.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('BOS10_regular_exempt.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.seller_state_code', r.seller_state_code, '27');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.buyer_state_code', r.buyer_state_code, '27');
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.taxable', r.lines[1].taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.cgst', r.lines[1].cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.sgst', r.lines[1].sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.igst', r.lines[1].igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.line_total', r.lines[1].line_total_minor, 50000);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('BOS10_regular_exempt.L1.unit_price', r.lines[1].unit_price_minor, 50000);
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.L1.taxable_str', r.lines[1].taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS10_regular_exempt.L1.line_total_str', r.lines[1].line_total_str, '500.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Neighbourhood Store',NULL,'seller','unregistered','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','1','500.00',0,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.taxable', r.taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.cgst', r.cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.sgst', r.sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.igst', r.igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.gross', r.gross_total_minor, 50000);
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.gross_str', r.gross_total_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.taxable_str', r.taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.document_type', r.document_type, 'bill_of_supply');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.document_title', r.document_title, 'Invoice');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.no_itc_note', r.no_itc_note, 'No tax has been charged on this document. No input tax credit is available against it.');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.tax_treatment', r.tax_treatment, 'no_tax');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.pos_code', r.place_of_supply_code, '27');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.pos_name', r.place_of_supply_name, 'Maharashtra');
+  PERFORM inv_assert_bool('BOS11_no_itc_note.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('BOS11_no_itc_note.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.seller_state_code', r.seller_state_code, '27');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.buyer_state_code', r.buyer_state_code, '27');
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.taxable', r.lines[1].taxable_value_minor, 50000);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.cgst', r.lines[1].cgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.sgst', r.lines[1].sgst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.igst', r.lines[1].igst_minor, NULL::bigint);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.line_total', r.lines[1].line_total_minor, 50000);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.qty_milli', r.lines[1].quantity_milli, 1000);
+  PERFORM inv_assert_eq('BOS11_no_itc_note.L1.unit_price', r.lines[1].unit_price_minor, 50000);
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.L1.qty_str', r.lines[1].quantity_str, '1');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.L1.taxable_str', r.lines[1].taxable_value_str, '500.00');
+  PERFORM inv_assert_text_eq('BOS11_no_itc_note.L1.line_total_str', r.lines[1].line_total_str, '500.00');
+END $D$;
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Karnataka',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('Example Service','998315','0.333','900.00',0.18,'0',false)::inv_line_input]);
+  PERFORM inv_assert_eq('RP_quantity_0333.taxable', r.taxable_value_minor, 29970);
+  PERFORM inv_assert_eq('RP_quantity_0333.cgst', r.cgst_minor, 2698);
+  PERFORM inv_assert_eq('RP_quantity_0333.sgst', r.sgst_minor, 2698);
+  PERFORM inv_assert_eq('RP_quantity_0333.igst', r.igst_minor, 0);
+  PERFORM inv_assert_eq('RP_quantity_0333.round_off', r.round_off_minor, NULL::bigint);
+  PERFORM inv_assert_eq('RP_quantity_0333.gross', r.gross_total_minor, 35366);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.gross_str', r.gross_total_str, '353.66');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.taxable_str', r.taxable_value_str, '299.70');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.document_type', r.document_type, 'tax_invoice');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.document_title', r.document_title, 'Tax Invoice');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.statutory_legend', r.statutory_legend, NULL);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.no_itc_note', r.no_itc_note, NULL);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.tax_treatment', r.tax_treatment, 'intrastate');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.pos_code', r.place_of_supply_code, '29');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.pos_name', r.place_of_supply_name, 'Karnataka');
+  PERFORM inv_assert_bool('RP_quantity_0333.pos_resolved', r.place_of_supply_resolved, true);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.currency', r.currency, 'INR');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.fx_rate', r.fx_rate, NULL);
+  PERFORM inv_assert_eq('RP_quantity_0333.amount_inr_minor', r.amount_inr_minor, NULL::bigint);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.invoice_number', r.invoice_number, NULL);
+  PERFORM inv_assert_bool('RP_quantity_0333.numbered', r.numbered, false);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.buyer_eff_status', r.buyer_effective_registration_status, 'unregistered');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.seller_state_code', r.seller_state_code, '29');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.buyer_state_code', r.buyer_state_code, '29');
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.taxable', r.lines[1].taxable_value_minor, 29970);
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.cgst', r.lines[1].cgst_minor, 2698);
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.sgst', r.lines[1].sgst_minor, 2698);
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.line_total', r.lines[1].line_total_minor, 35366);
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.qty_milli', r.lines[1].quantity_milli, 333);
+  PERFORM inv_assert_eq('RP_quantity_0333.L1.unit_price', r.lines[1].unit_price_minor, 90000);
+  PERFORM inv_assert_text_eq('RP_quantity_0333.L1.hsn_sac', r.lines[1].hsn_sac, '998315');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.L1.qty_str', r.lines[1].quantity_str, '0.333');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.L1.taxable_str', r.lines[1].taxable_value_str, '299.70');
+  PERFORM inv_assert_text_eq('RP_quantity_0333.L1.line_total_str', r.lines[1].line_total_str, '353.66');
+END $D$;
+\echo '=== negative (raise) cases ==='
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_party('buyer',NULL,'92AAAAA0000A1Z5');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS4 buyer gstin 92 prefix',false,'no error','raise ER028');
+  EXCEPTION WHEN SQLSTATE 'ER028' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS4 buyer gstin 92 prefix',true,SQLSTATE,'ER028');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS4 buyer gstin 92 prefix',false,SQLSTATE,'ER028');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_party('seller','regular','92AAAAA0000A1Z5');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS5 seller gstin 92 prefix',false,'no error','raise ER028');
+  EXCEPTION WHEN SQLSTATE 'ER028' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS5 seller gstin 92 prefix',true,SQLSTATE,'ER028');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS5 seller gstin 92 prefix',false,SQLSTATE,'ER028');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_party('seller','unregistered','27CCCCC0000C1Z5');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS3 unregistered seller with gstin',false,'no error','raise ER029');
+  EXCEPTION WHEN SQLSTATE 'ER029' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS3 unregistered seller with gstin',true,SQLSTATE,'ER029');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS3 unregistered seller with gstin',false,SQLSTATE,'ER029');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_party('seller','regular',NULL);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS4 regular seller no gstin',false,'no error','raise ER029');
+  EXCEPTION WHEN SQLSTATE 'ER029' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS4 regular seller no gstin',true,SQLSTATE,'ER029');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS4 regular seller no gstin',false,SQLSTATE,'ER029');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_party('buyer','regular',NULL);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS5 regular buyer no gstin',false,'no error','raise ER029');
+  EXCEPTION WHEN SQLSTATE 'ER029' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS5 regular buyer no gstin',true,SQLSTATE,'ER029');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS5 regular buyer no gstin',false,SQLSTATE,'ER029');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_party('seller','composition',NULL);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS6 composition seller no gstin',false,'no error','raise ER029');
+  EXCEPTION WHEN SQLSTATE 'ER029' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS6 composition seller no gstin',true,SQLSTATE,'ER029');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS6 composition seller no gstin',false,SQLSTATE,'ER029');
+  END;
+END $D$;
+DO $D$ BEGIN
+  PERFORM inv_gst_validate_party('buyer',NULL,NULL);
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS7 buyer null status no gstin ok',true,'no error','no error');
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS7 buyer null status no gstin ok',false,SQLSTATE,'no error');
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','1','100.00',18.0,'0',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI1 gst_rate 18.0',false,'no error','raise ER032');
+  EXCEPTION WHEN SQLSTATE 'ER032' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI1 gst_rate 18.0',true,SQLSTATE,'ER032');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI1 gst_rate 18.0',false,SQLSTATE,'ER032');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','1','100.00',1.5,'0',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI2 gst_rate 1.5',false,'no error','raise ER032');
+  EXCEPTION WHEN SQLSTATE 'ER032' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI2 gst_rate 1.5',true,SQLSTATE,'ER032');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI2 gst_rate 1.5',false,SQLSTATE,'ER032');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','1','100.00',0.15,'0',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI3 gst_rate 0.15 not slab',false,'no error','raise ER033');
+  EXCEPTION WHEN SQLSTATE 'ER033' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI3 gst_rate 0.15 not slab',true,SQLSTATE,'ER033');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI3 gst_rate 0.15 not slab',false,SQLSTATE,'ER033');
+  END;
+END $D$;
+DO $D$ BEGIN
+  PERFORM inv_gst_validate_line('x','998315','1','100.00',0.40,'0',true);
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI4 gst_rate 0.40 with override',true,'no error','no error');
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI4 gst_rate 0.40 with override',false,SQLSTATE,'no error');
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','1','-1.00',0.18,'0',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI6 negative unit_price',false,'no error','raise ER034');
+  EXCEPTION WHEN SQLSTATE 'ER034' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI6 negative unit_price',true,SQLSTATE,'ER034');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI6 negative unit_price',false,SQLSTATE,'ER034');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','1','100.00',0.18,'-5.00',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI7 negative line_discount',false,'no error','raise ER035');
+  EXCEPTION WHEN SQLSTATE 'ER035' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI7 negative line_discount',true,SQLSTATE,'ER035');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI7 negative line_discount',false,SQLSTATE,'ER035');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','1','100.00',0.18,'150.00',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI8 discount > price',false,'no error','raise ER036');
+  EXCEPTION WHEN SQLSTATE 'ER036' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI8 discount > price',true,SQLSTATE,'ER036');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI8 discount > price',false,SQLSTATE,'ER036');
+  END;
+END $D$;
+DO $D$ BEGIN
+  PERFORM inv_gst_validate_line('x','998315','1','100.00',0.18,'100.00',false);
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI9 discount == price ok',true,'no error','no error');
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI9 discount == price ok',false,SQLSTATE,'no error');
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','998315','0','100.00',0.18,'0',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI10 zero quantity',false,'no error','raise ER031');
+  EXCEPTION WHEN SQLSTATE 'ER031' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI10 zero quantity',true,SQLSTATE,'ER031');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI10 zero quantity',false,SQLSTATE,'ER031');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_line('x','   ','1','100.00',0.18,'0',false);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI_hsn_required',false,'no error','raise ER030');
+  EXCEPTION WHEN SQLSTATE 'ER030' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI_hsn_required',true,SQLSTATE,'ER030');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('LI_hsn_required',false,SQLSTATE,'ER030');
+  END;
+END $D$;
+SELECT inv_assert_bool('slab_allowed(0)', (inv_gst_is_allowed_rate(0)), true);
+SELECT inv_assert_bool('slab_allowed(0.0025)', (inv_gst_is_allowed_rate(0.0025)), true);
+SELECT inv_assert_bool('slab_allowed(0.03)', (inv_gst_is_allowed_rate(0.03)), true);
+SELECT inv_assert_bool('slab_allowed(0.05)', (inv_gst_is_allowed_rate(0.05)), true);
+SELECT inv_assert_bool('slab_allowed(0.12)', (inv_gst_is_allowed_rate(0.12)), true);
+SELECT inv_assert_bool('slab_allowed(0.18)', (inv_gst_is_allowed_rate(0.18)), true);
+SELECT inv_assert_bool('slab_allowed(0.28)', (inv_gst_is_allowed_rate(0.28)), true);
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('INR',NULL,NULL,'seller','buyer',0);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II1 empty lines',false,'no error','raise ER037');
+  EXCEPTION WHEN SQLSTATE 'ER037' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II1 empty lines',true,SQLSTATE,'ER037');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II1 empty lines',false,SQLSTATE,'ER037');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_number_assert_lawful('INV/26-27/0000001');
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II2 invoice number >16',false,'no error','raise ER040');
+  EXCEPTION WHEN SQLSTATE 'ER040' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II2 invoice number >16',true,SQLSTATE,'ER040');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II2 invoice number >16',false,SQLSTATE,'ER040');
+  END;
+END $D$;
+DO $D$ BEGIN
+  PERFORM inv_number_assert_lawful('INV/26-27/000001');
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II3 lawful 16-char number',true,'no error','no error');
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II3 lawful 16-char number',false,SQLSTATE,'no error');
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('INR',NULL,NULL,'buyer','buyer',1);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II4 seller role wrong',false,'no error','raise ER042');
+  EXCEPTION WHEN SQLSTATE 'ER042' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II4 seller role wrong',true,SQLSTATE,'ER042');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II4 seller role wrong',false,SQLSTATE,'ER042');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('INR',NULL,NULL,'seller','seller',1);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II5 buyer role wrong',false,'no error','raise ER042');
+  EXCEPTION WHEN SQLSTATE 'ER042' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II5 buyer role wrong',true,SQLSTATE,'ER042');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II5 buyer role wrong',false,SQLSTATE,'ER042');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('USD',NULL,NULL,'seller','buyer',1);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II6 foreign no fx',false,'no error','raise ER038');
+  EXCEPTION WHEN SQLSTATE 'ER038' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II6 foreign no fx',true,SQLSTATE,'ER038');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II6 foreign no fx',false,SQLSTATE,'ER038');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('USD','83.12',NULL,'seller','buyer',1);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II7 foreign fx no amount_inr',false,'no error','raise ER038');
+  EXCEPTION WHEN SQLSTATE 'ER038' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II7 foreign fx no amount_inr',true,SQLSTATE,'ER038');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II7 foreign fx no amount_inr',false,SQLSTATE,'ER038');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('INR','83.12',NULL,'seller','buyer',1);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II8 INR with fx present',false,'no error','raise ER038');
+  EXCEPTION WHEN SQLSTATE 'ER038' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II8 INR with fx present',true,SQLSTATE,'ER038');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II8 INR with fx present',false,SQLSTATE,'ER038');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_gst_validate_invoice_header('USD','83.12','-100.00','seller','buyer',1);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II9 negative amount_inr',false,'no error','raise ER039');
+  EXCEPTION WHEN SQLSTATE 'ER039' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II9 negative amount_inr',true,SQLSTATE,'ER039');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('II9 negative amount_inr',false,SQLSTATE,'ER039');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_compute_invoice(ROW('Acme Sellerworks','27AAAAA0000A1Z5','seller','regular','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic','bill_of_supply',false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('x','998315','1','500.00',0.18,NULL,false)::inv_line_input]);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS8 nonzero rate on BOS',false,'no error','raise ER046');
+  EXCEPTION WHEN SQLSTATE 'ER046' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS8 nonzero rate on BOS',true,SQLSTATE,'ER046');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS8 nonzero rate on BOS',false,SQLSTATE,'ER046');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_compute_invoice(ROW('Acme Composition Store','27AAAAA0000B1Z5','seller','composition','Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic','tax_invoice',false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('x','998315','1','500.00',0,NULL,false)::inv_line_input]);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS9 composition tax_invoice',false,'no error','raise ER045');
+  EXCEPTION WHEN SQLSTATE 'ER045' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS9 composition tax_invoice',true,SQLSTATE,'ER045');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS9 composition tax_invoice',false,SQLSTATE,'ER045');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_compute_invoice(ROW('Acme Sellerworks',NULL,'seller',NULL,'Maharashtra',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Maharashtra',NULL)::inv_party_input,'domestic',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('x','998315','1','500.00',0,NULL,false)::inv_line_input]);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS12 seller reg null',false,'no error','raise ER043');
+  EXCEPTION WHEN SQLSTATE 'ER043' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS12 seller reg null',true,SQLSTATE,'ER043');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('BOS12 seller reg null',false,SQLSTATE,'ER043');
+  END;
+END $D$;
+DO $D$ BEGIN
+  BEGIN
+    PERFORM inv_compute_invoice(ROW('Acme Sellerworks','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Buyer Pvt Ltd',NULL,'buyer',NULL,'Outside India',NULL)::inv_party_input,'export_lut',NULL,false,false,'INR',NULL,NULL,NULL,'2026-09-11'::timestamptz,ARRAY[ROW('x','998315','1','1180.00',0.18,NULL,false)::inv_line_input]);
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS8 export_lut nonzero rate',false,'no error','raise ER046');
+  EXCEPTION WHEN SQLSTATE 'ER046' THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS8 export_lut nonzero rate',true,SQLSTATE,'ER046');
+  WHEN OTHERS THEN
+    INSERT INTO _inv_diff_results(label,passed,actual,expected) VALUES('POS8 export_lut nonzero rate',false,SQLSTATE,'ER046');
+  END;
+END $D$;
+\echo '=== Multi-line export invoices, two distinct SAC codes (beyond PHP oracle) ==='
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Example Exports Pvt Ltd','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Overseas Inc',NULL,'buyer',NULL,'Outside India',NULL)::inv_party_input,'export_lut',NULL,false,false,'USD','95.7245','19144.90','INV-TEST-011','2026-09-13'::timestamptz,ARRAY[ROW('Managed Web Hosting','998315','1','200.00',0,NULL,false)::inv_line_input]);
+  PERFORM inv_assert_eq('INV11.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_eq('INV11.cgst', r.lines[1].cgst_minor, 0);
+  PERFORM inv_assert_eq('INV11.sgst', r.lines[1].sgst_minor, 0);
+  PERFORM inv_assert_text_eq('INV11.tax_treatment', r.tax_treatment, 'export_lut');
+  PERFORM inv_assert_text_eq('INV11.pos_name (Outside India)', r.place_of_supply_name, 'Other Country');
+  PERFORM inv_assert_text_eq('INV11.sac_per_line', r.lines[1].hsn_sac, '998315');
+END $D$;
+SELECT inv_assert_eq('INV11.statutory_inr_paisa (200.00 x 95.7245)', (inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','200.00')), 1914490);
+SELECT inv_assert_text_eq('INV11.statutory_inr_str', (inv_money_to_decimal_string(inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','200.00'))), '19144.90');
+DO $D$ DECLARE r inv_computed_invoice; BEGIN
+  r := inv_compute_invoice(ROW('Example Exports Pvt Ltd','29AAAAA0000A1Z5','seller','regular','Karnataka',NULL)::inv_party_input,ROW('Acme Overseas Inc',NULL,'buyer',NULL,'Outside India',NULL)::inv_party_input,'export_lut',NULL,false,false,'USD','95.7245','7179.34','INV-TEST-010','2026-09-13'::timestamptz,ARRAY[ROW('Software Dev Consultation','998313','1','75.00',0,NULL,false)::inv_line_input]);
+  PERFORM inv_assert_eq('INV10.igst', r.lines[1].igst_minor, 0);
+  PERFORM inv_assert_text_eq('INV10.tax_treatment', r.tax_treatment, 'export_lut');
+  PERFORM inv_assert_text_eq('INV10.pos_name (Outside India)', r.place_of_supply_name, 'Other Country');
+  PERFORM inv_assert_text_eq('INV10.sac_per_line (distinct SAC)', r.lines[1].hsn_sac, '998313');
+END $D$;
+SELECT inv_assert_eq('INV10.statutory_inr_paisa (75.00 x 95.7245)', (inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','75.00')), 717934);
+SELECT inv_assert_text_eq('INV10.statutory_inr_str', (inv_money_to_decimal_string(inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','75.00'))), '7179.34');
+
+\echo '=== DIFFERENTIAL TALLY (expect failed = 0) ==='
+SELECT count(*) AS total, count(*) FILTER (WHERE passed) AS passed, count(*) FILTER (WHERE NOT passed) AS failed FROM _inv_diff_results;
+\echo '=== ANY FAILURES BELOW (none expected) ==='
+SELECT label, actual, expected FROM _inv_diff_results WHERE NOT passed ORDER BY id;

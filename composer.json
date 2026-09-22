@@ -1,0 +1,84 @@
+{
+    "name": "progalaxyelabs/stonescriptphp-payments",
+    "description": "The unified payment system for StoneScriptPHP — merges what were separately-published stonescriptphp-pay (Razorpay/PayPal transport drivers) and stonescriptphp-invoice (SQL-first billing/invoicing) into one package: gateway drivers, the idempotent payment-capture primitive, and SQL-first subscription/one-time/credit/wallet/consumption/passthrough pricing, invoices, parties, pluggable regional tax computation (ships India GST), gateway routing, and durable transactional-outbox intimation. All business logic lives in PostgreSQL functions deployed via the StoneScriptDB Gateway; PHP is transport only.",
+    "type": "library",
+    "version": "0.1.0",
+    "license": "MIT",
+    "keywords": [
+        "php",
+        "sql",
+        "postgresql",
+        "payments",
+        "billing",
+        "invoicing",
+        "razorpay",
+        "payment-gateway",
+        "subscription",
+        "tax",
+        "gst",
+        "stonescriptphp"
+    ],
+    "homepage": "https://stonescriptphp.org",
+    "support": {
+        "issues": "https://github.com/progalaxyelabs/stonescriptphp-payments/issues",
+        "source": "https://github.com/progalaxyelabs/stonescriptphp-payments"
+    },
+    "authors": [
+        {
+            "name": "StoneScriptPHP Team",
+            "email": "hello@stonescriptphp.org",
+            "homepage": "https://stonescriptphp.org"
+        }
+    ],
+    "replace": {
+        "progalaxyelabs/stonescriptphp-invoice": "*",
+        "progalaxyelabs/stonescriptphp-pay": "*"
+    },
+    "require": {
+        "php": "^8.2",
+        "ext-json": "*",
+        "razorpay/razorpay": "^2.9"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0",
+        "progalaxyelabs/stonescriptphp": "^9.17.0"
+    },
+    "suggest": {
+        "progalaxyelabs/stonescriptphp": "Required ONLY to use src/Php/InvoiceSourceAdapter.php — the sole PHP transport shim in this package's SQL-first invoicing side, implementing StoneScriptPHP\\Billing\\Contracts\\InvoiceSource. Pure-SQL usage (issue invoices, run collections/dunning queries, manual mark-paid) and the payment-driver side never need the framework."
+    },
+    "autoload": {
+        "psr-4": {
+            "StoneScriptPay\\": "src/",
+            "StoneScriptPHP\\Invoice\\Php\\": "src/Php/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/Unit/",
+            "Tests\\Invoice\\": "tests/php/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true,
+        "preferred-install": "dist"
+    },
+    "archive": {
+        "exclude": [
+            "/tests",
+            "/.github",
+            "/.git",
+            "/.env",
+            "/.env.*",
+            "*.log",
+            "/vendor",
+            "/.phpunit.cache",
+            "/.claude"
+        ]
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

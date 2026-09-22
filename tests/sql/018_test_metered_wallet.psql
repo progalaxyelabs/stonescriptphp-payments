@@ -1,0 +1,114 @@
+-- stonescriptphp-pay :: an example prepaid wallet — the PRIORITY case.
+-- Proves Case 1 (wallet drained by a metered per-SKU RATE), Case 2
+-- (variable-amount top-up + minimum floor), Case 3 (recurring/free grants,
+-- idempotent), plus expiry/forfeiture, sufficiency gating, and no-grandfather
+-- rate change. Prices/rates are editable config rows (₹49/credit is the
+-- decided example number; the per-SKU drain rates are example values a row
+-- UPDATE can retune) — the SHAPE is the example model.
+\set priya_tenant '''00000000-0000-0000-0000-000000000010'''
+\set platform     '''testplatform'''
+
+-- Catalog (example): credit_unit_price 4900 paisa/credit, tax-inclusive, minimum
+-- top-up 4900; credits never expire (expiry policy is undecided — modelled
+-- as NULL = perpetual; the free grants below DO expire, to exercise forfeiture).
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (10, 'Example Credit Wallet', false, true, false, '2026-07-01', 'seed');
+
+INSERT INTO wallet_topup_plans
+    (id, pricing_plan_id, credit_unit_price, min_topup_amount, credit_validity_duration, credit_validity_uom, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (1, 10, 4900, 4900, NULL, NULL, false, true, '2026-07-01', 'seed');  -- ₹49/credit incl GST, ₹49 min, no expiry
+
+-- Usage SKUs drain the ONE wallet at whole-credit rates (example config rows):
+INSERT INTO wallet_drain_rates
+    (id, pricing_plan_id, sku_code, unit_of_measure, credits_per_unit, is_active, created_at, created_by)
+VALUES
+    (1, 10, 'SKU-1', 'compute-hour', 1, true, '2026-07-01', 'seed'),  -- Light: 1 credit/hour
+    (2, 10, 'SKU-2', 'compute-hour', 2, true, '2026-07-01', 'seed'),  -- Standard: 2 credits/hour
+    (3, 10, 'SKU-3', 'compute-hour', 4, true, '2026-07-01', 'seed');  -- Performance: 4 credits/hour
+
+-- ---- Case 3: recurring free grant (recurring add-on plan / monthly free) ----
+\echo '--- grant_free_credits(priya, 5 credits, expires 2026-08-01, key free-2026-07) ---'
+SELECT id, source, granted_credits, amount_paid, expires_at FROM grant_free_credits(:priya_tenant, :platform, 5, '2026-07-01', '2026-08-01', 'api', 'free-2026-07');
+
+\echo '--- wallet balance @ 2026-07-01 -> expect 5 ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-07-01');
+
+-- ---- Case 2: variable-amount top-up at the ₹49 minimum, then a ₹490 top-up ----
+\echo '--- topup ₹49 (4900 paisa) -> expect 1 credit granted ---'
+SELECT granted_credits, amount_paid, unit_price_pinned, expires_at FROM topup_wallet(:priya_tenant, :platform, 1, 4900, '2026-07-02', 'api');
+
+\echo '--- topup ₹490 (49000 paisa) -> expect 10 credits granted ---'
+SELECT granted_credits, amount_paid FROM topup_wallet(:priya_tenant, :platform, 1, 49000, '2026-07-03', 'api');
+
+\echo '--- wallet balance @ 2026-07-03 -> expect 16 (5 free + 1 + 10) ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-07-03');
+
+-- ---- Case 1: metered drain at per-SKU rate, FIFO by expiry ----
+\echo '--- drain SKU-1 (1 credit/hr) x 3 hrs @ 2026-07-05 -> debits 3 credits (from soonest-expiring free grant) ---'
+SELECT quantity_consumed, credits_debited FROM record_wallet_drain(:priya_tenant, :platform, 10, 'SKU-1', '2026-07-05', 3, 'metering');
+
+\echo '--- wallet balance @ 2026-07-06 -> expect 13 (16 - 3) ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-07-06');
+
+\echo '--- drain SKU-3 (4 credits/hr) x 2 hrs @ 2026-07-10 -> debits 8 credits (2 left in free grant, then 1, then 5 from ₹490 batch) ---'
+SELECT quantity_consumed, credits_debited FROM record_wallet_drain(:priya_tenant, :platform, 10, 'SKU-3', '2026-07-10', 2, 'metering');
+
+\echo '--- wallet balance @ 2026-07-11 -> expect 5 (13 - 8; all remaining in the perpetual ₹490 batch) ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-07-11');
+
+-- ---- Case 2 negatives: minimum floor and whole-multiple rule ----
+\echo '--- topup ₹40 (4000 paisa), below ₹49 min -> expect ER013 ---'
+SELECT * FROM topup_wallet(:priya_tenant, :platform, 1, 4000, '2026-07-12', 'api');
+
+\echo '--- topup ₹70 (7000 paisa), not a whole multiple of ₹49 -> expect ER014 ---'
+SELECT * FROM topup_wallet(:priya_tenant, :platform, 1, 7000, '2026-07-12', 'api');
+
+-- ---- Case 3 idempotency: the lazy monthly grant is safe to call twice ----
+\echo '--- grant_free_credits again with key free-2026-07 -> expect ER017 (already granted this period) ---'
+SELECT * FROM grant_free_credits(:priya_tenant, :platform, 5, '2026-07-15', '2026-08-01', 'api', 'free-2026-07');
+
+-- ---- Expiry / forfeiture ----
+\echo '--- next month grant: 5 credits @ 2026-08-01, expires 2026-09-01, key free-2026-08 ---'
+SELECT granted_credits, expires_at FROM grant_free_credits(:priya_tenant, :platform, 5, '2026-08-01', '2026-09-01', 'api', 'free-2026-08');
+
+\echo '--- wallet balance @ 2026-08-02 -> expect 10 (5 perpetual + 5 new grant; July free grant fully drained, nothing forfeited) ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-08-02');
+
+\echo '--- wallet balance @ 2026-09-05 [Aug grant expired 09-01 with 5 UNUSED -> forfeited] -> expect 5 ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-09-05');
+
+-- ---- Sufficiency gate ----
+\echo '--- drain SKU-3 x 2 hrs (needs 8) @ 2026-09-10 with only 5 available -> expect ER016 ---'
+SELECT * FROM record_wallet_drain(:priya_tenant, :platform, 10, 'SKU-3', '2026-09-10', 2, 'metering');
+
+\echo '--- drain an unknown SKU-9 -> expect ER018 ---'
+SELECT * FROM record_wallet_drain(:priya_tenant, :platform, 10, 'SKU-9', '2026-09-10', 1, 'metering');
+
+-- ---- No-grandfather rate change: SKU-1 doubles 1 -> 2 credits/hr on 2026-09-15 ----
+-- Deactivate the old rate BEFORE inserting the new active one (unique index
+-- allows only one active rate per (plan, sku)); set the superseded pointer
+-- AFTER the new row exists (its FK must resolve).
+UPDATE wallet_drain_rates SET is_active = false WHERE id = 1;
+INSERT INTO wallet_drain_rates
+    (id, pricing_plan_id, sku_code, unit_of_measure, credits_per_unit, is_active, created_at, created_by)
+VALUES
+    (4, 10, 'SKU-1', 'compute-hour', 2, true, '2026-09-15', 'seed');
+UPDATE wallet_drain_rates SET superseded_by_wallet_drain_rate_id = 4 WHERE id = 1;
+
+\echo '--- topup ₹490 -> 10 credits @ 2026-09-16 (balance now 15) ---'
+SELECT granted_credits FROM topup_wallet(:priya_tenant, :platform, 1, 49000, '2026-09-16', 'api');
+
+\echo '--- drain SKU-1 x 3 hrs @ 2026-09-16 under NEW rate -> debits 6 credits (2/hr), NOT 3 ---'
+SELECT credits_debited FROM record_wallet_drain(:priya_tenant, :platform, 10, 'SKU-1', '2026-09-16', 3, 'metering');
+
+\echo '--- wallet balance @ 2026-09-17 -> expect 9 (15 - 6) ---'
+SELECT get_wallet_balance(:priya_tenant, :platform, '2026-09-17');
+
+\echo '--- the OLD 2026-07-05 SKU-1 drain still pins credits_debited = 3 (no grandfathering rewrite) ---'
+SELECT usage_at, credits_debited FROM wallet_drain_events WHERE tenant_id = :priya_tenant AND platform_code = :platform AND usage_at = '2026-07-05';
+
+-- ER001's trigger condition changed at the 2026-09-22 identity merge (see
+-- 005's note): there is no local "customers" existence check anymore.
+\echo '--- get_wallet_balance(NULL platform_code) — malformed identity, expect ER001 ---'
+SELECT get_wallet_balance(:priya_tenant, NULL, '2026-07-01');

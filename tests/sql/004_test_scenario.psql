@@ -1,0 +1,67 @@
+-- stonescriptphp-pay :: a worked end-to-end scenario
+-- Monthly plan sold at ₹349 from Oct 1; ₹359 price row created Oct 12,
+-- supersedes ₹349. Alice bought before the change, Bob after.
+--
+-- IDENTITY (2026-09-22 merge): tenants are identified by (tenant_id UUID,
+-- platform_code VARCHAR(50)) — the SAME shape as progalaxyelabs-auth's own
+-- tenant_memberships, resolved from the caller's JWT, never a local
+-- surrogate "customers" row. Test fixtures use fixed, well-known UUIDs so
+-- later files in the suite can reference the same tenant consistently.
+\set alice_tenant '''00000000-0000-0000-0000-000000000001'''
+\set bob_tenant   '''00000000-0000-0000-0000-000000000002'''
+\set platform     '''testplatform'''
+
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, created_at, created_by)
+VALUES (1, 'Monthly', true, true, '2026-10-01', 'seed');
+
+INSERT INTO subscription_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by)
+VALUES
+    (1, 1, 1, 'month', 34900, true, true, false, '2026-10-01', 'seed'), -- ₹349, superseded
+    (2, 1, 1, 'month', 35900, true, true, true,  '2026-10-12', 'seed'); -- ₹359, current
+
+UPDATE subscription_pricing_plans SET superseded_by_subscription_pricing_plan_id = 2 WHERE id = 1;
+
+-- Relies on BIGSERIAL auto-increment giving Alice's row id=1, Bob's id=2 (the
+-- rest of this file and 005/008 reference those row ids directly for
+-- cancel_subscription_pricing_plan, which takes the ROW id, not a tenant).
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:alice_tenant, :platform, 1, 1, '2026-10-01', '2026-10-01', 'seed'),  -- Alice pinned to the ₹349 row
+    (:bob_tenant,   :platform, 1, 2, '2026-10-13', '2026-10-13', 'seed');  -- Bob pinned to the ₹359 row
+
+
+-- 1. Pricing page today: only ₹359 should show, ₹349 must NOT appear.
+\echo '--- get_pricing_plans() ---'
+SELECT * FROM get_pricing_plans();
+
+-- 2. Alice's billing page: must still show ₹349, unaffected by the catalog change.
+\echo '--- get_customer_pricing_plan(alice)  [Alice] ---'
+SELECT * FROM get_customer_pricing_plan(:alice_tenant, :platform);
+
+-- 3. Bob's billing page: should show ₹359.
+\echo '--- get_customer_pricing_plan(bob)  [Bob] ---'
+SELECT * FROM get_customer_pricing_plan(:bob_tenant, :platform);
+
+-- 4. Cancel Alice's subscription.
+\echo '--- cancel_subscription_pricing_plan(1, 2026-11-01) ---'
+SELECT * FROM cancel_subscription_pricing_plan(1, '2026-11-01', 'customer_requested');
+
+-- 5. Alice now has no active plan -> zero rows, not an error.
+\echo '--- get_customer_pricing_plan(alice) after cancel  [expect 0 rows] ---'
+SELECT * FROM get_customer_pricing_plan(:alice_tenant, :platform);
+
+-- 6. Cancelling again must fail loud, not silently no-op.
+\echo '--- cancel_subscription_pricing_plan(1, ...) again  [expect ERROR] ---'
+SELECT * FROM cancel_subscription_pricing_plan(1, '2026-11-05', 'customer_requested');
+
+-- 7. A malformed identity (NULL platform_code) must fail loud — this is the
+-- ONLY existence-style guard left at this layer: real tenant EXISTENCE is
+-- the auth service's job (verified before this SQL is ever reached, via the
+-- caller's JWT), not something this table can check locally without a
+-- cross-DB FK (see the identity-column note on customer_pricing_plans).
+-- A well-formed but never-enrolled tenant_id/platform_code pair legitimately
+-- returns zero rows (case 5 above), not an error — that IS the honest answer.
+\echo '--- get_customer_pricing_plan(NULL platform_code)  [expect ERROR] ---'
+SELECT * FROM get_customer_pricing_plan(:alice_tenant, NULL);

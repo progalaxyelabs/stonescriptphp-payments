@@ -1,0 +1,40 @@
+-- stonescriptphp-pay :: pricing change 3 months in — old tenants stay pinned,
+-- new tenants get the new price, the pricing page only ever shows current.
+\set dave_tenant '''00000000-0000-0000-0000-000000000004'''
+\set eve_tenant  '''00000000-0000-0000-0000-000000000005'''
+\set platform    '''testplatform'''
+
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:dave_tenant, :platform, 5, 4, '2026-01-05', '2026-01-05', 'seed');  -- Dave: Monthly @ ₹349 (subscription_pricing_plan_id=4)
+
+-- 3 months later: price increase ₹349 -> ₹399 on the Monthly cadence.
+INSERT INTO subscription_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by)
+VALUES
+    (6, 5, 1, 'month', 39900, true, false, true, '2026-04-01', 'seed');  -- ₹399 + GST / month
+
+UPDATE subscription_pricing_plans
+SET is_active = false, superseded_by_subscription_pricing_plan_id = 6
+WHERE id = 4;
+
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:eve_tenant, :platform, 5, 6, '2026-04-10', '2026-04-10', 'seed');  -- Eve: Monthly @ ₹399 (subscription_pricing_plan_id=6)
+
+\echo '--- get_pricing_plans() — Monthly listing must now show ₹399, never ₹349 ---'
+SELECT * FROM get_pricing_plans();
+
+\echo '--- get_customer_pricing_plan(dave)  [Dave] — still ₹349, pinned, unaffected by the increase ---'
+SELECT * FROM get_customer_pricing_plan(:dave_tenant, :platform);
+
+\echo '--- get_customer_pricing_plan(eve)  [Eve] — ₹399, the new price ---'
+SELECT * FROM get_customer_pricing_plan(:eve_tenant, :platform);
+
+\echo '--- get_active_pricing_plan(dave, 2026-01-20) — Dave active at his old price, mid-period ---'
+SELECT * FROM get_active_pricing_plan(:dave_tenant, :platform, '2026-01-20');
+
+\echo '--- get_active_pricing_plan(dave, 2026-02-10) — Dave lapsed (never renewed), 0 rows ---'
+SELECT * FROM get_active_pricing_plan(:dave_tenant, :platform, '2026-02-10');

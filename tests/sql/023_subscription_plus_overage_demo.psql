@@ -1,0 +1,52 @@
+-- stonescriptphp-pay :: TEST/DEMO companion of the subscription+overage objects.
+-- Run with ON_ERROR_STOP=0. This file carries the demo seed data, worked-figure
+-- assertions and the by-design negative (ER*) cases that must NOT ship in the
+-- deployable schema.
+\set sana_tenant '''00000000-0000-0000-0000-000000000015'''
+\set platform    '''testplatform'''
+
+-- ================= seed + test =================
+-- Base plan (subscription, postpaid, ₹1,500/mo, bundles 100 compute-hours):
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (13, 'Production Hosting (base)', true,  true, false, '2026-06-01', 'seed'),
+    (14, 'Production Overage',        false, true, false, '2026-06-01', 'seed');
+
+INSERT INTO subscription_pricing_plans
+    (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, included_quantity, included_unit_of_measure, created_at, created_by)
+VALUES
+    (9, 13, 1, 'month', 150000, true, true, true, 100, 'compute-hour', '2026-06-01', 'seed');  -- ₹1,500, includes 100 hrs
+
+-- Overage rate (consumption engine), ₹5/compute-hour beyond the allowance:
+INSERT INTO consumption_pricing_plans
+    (id, pricing_plan_id, unit_of_measure, rate_per_unit, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES
+    (3, 14, 'compute-hour', 500, true, true, '2026-06-01', 'seed');  -- ₹5/hr overage
+
+INSERT INTO customer_pricing_plans
+    (tenant_id, platform_code, pricing_plan_id, subscription_pricing_plan_id, started_at, created_at, created_by)
+VALUES
+    (:sana_tenant, :platform, 13, 9, '2026-06-01', '2026-06-01', 'seed');  -- base sub, period 06-01..07-01
+
+SELECT * FROM enroll_consumption_plan(:sana_tenant, :platform, 3, '2026-06-01', 'api');
+
+-- June usage: 60 + 70 = 130 hrs; 100 included -> 30 hrs overage @ ₹5 = ₹150.
+SELECT record_usage(:sana_tenant, :platform, '2026-06-10', 60, 'metering');
+SELECT record_usage(:sana_tenant, :platform, '2026-06-20', 70, 'metering');
+
+\echo '--- June combined charge: base 150000, included 100, used 130, overage 30, overage_charge 15000, total 165000 ---'
+SELECT * FROM get_subscription_with_overage_charge(:sana_tenant, :platform, 13, 14, '2026-06-01', '2026-07-01');
+
+-- July: renew the base sub, use only 50 hrs (under the allowance -> no overage).
+\echo '--- renew base sub at 2026-07-01 (plain renewal) ---'
+SELECT customer_pricing_plan_id, started_at, expires_at FROM renew_subscription_pricing_plan(:sana_tenant, :platform, 9, '2026-07-01', 'api');
+
+SELECT record_usage(:sana_tenant, :platform, '2026-07-05', 50, 'metering');
+
+\echo '--- July combined charge: used 50 <= 100 included, overage 0, total = base only 150000 ---'
+SELECT * FROM get_subscription_with_overage_charge(:sana_tenant, :platform, 13, 14, '2026-07-01', '2026-08-01');
+
+\echo '--- overage charge for a period with no base subscription -> expect ER021 ---'
+SELECT * FROM get_subscription_with_overage_charge(:sana_tenant, :platform, 13, 14, '2030-01-01', '2030-02-01');
+
+\echo '--- existing plans are unaffected by the new columns: get_pricing_plans() still returns the catalog ---'
+SELECT pricing_plan_id, price_plan_id, amount FROM get_pricing_plans() ORDER BY pricing_plan_id, price_plan_id;
