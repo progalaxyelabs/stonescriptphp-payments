@@ -17,9 +17,9 @@ Completed the in-flight `Gst` -> `Tax/India` bucket-layout migration (deleted
 the superseded linear `src/Gst/Schema/main/`) and fixed two load-order bugs
 the half-finished split had left behind — see `LOAD-ORDER.md`.
 
-**Identity alignment to `progalaxyelabs-auth` (breaking schema change):**
+**Identity alignment to `the auth service` (breaking schema change):**
 every identity-bearing table/function now takes `tenant_id UUID` +
-`platform_code VARCHAR(50)` — matching `progalaxyelabs-auth`'s own
+`platform_code VARCHAR(50)` — matching `the auth service`'s own
 `tenant_memberships` shape exactly, resolved from the caller's JWT, never a
 cross-DB FK. The prototype `customers` fixture table (`customers.id
 BIGSERIAL`) is deleted entirely; no `customer_id` column survives anywhere

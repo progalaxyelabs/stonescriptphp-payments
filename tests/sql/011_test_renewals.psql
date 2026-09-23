@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: renew after expiry (gap), then renew early (seamless),
+-- stonescriptphp-payments :: renew after expiry (gap), then renew early (seamless),
 -- verify active-in-between, and pull the purchase history across a range.
 -- Continues Dave from 010: his Jan ₹349 monthly lapsed on
 -- 2026-02-05 and was never renewed. He renews late, then renews again early.

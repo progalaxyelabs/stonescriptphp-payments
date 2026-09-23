@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: switching cadence mid-cycle, prorated, both directions
+-- stonescriptphp-payments :: switching cadence mid-cycle, prorated, both directions
 -- Frank: Monthly (₹399) -> Annual (₹3,839) mid-cycle -> back to Monthly mid-year.
 \set frank_tenant '''00000000-0000-0000-0000-000000000006'''
 \set platform     '''testplatform'''

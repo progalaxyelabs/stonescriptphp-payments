@@ -1,0 +1,6 @@
+# This package is distributed and consumed as a PHP Composer package.
+# The .pgsql/.psql files are PostgreSQL schema/functions deployed via the
+# StoneScriptDB Gateway, not application source — exclude them from GitHub
+# Linguist language stats so the repo is reported as PHP.
+*.pgsql linguist-detectable=false
+*.psql linguist-detectable=false

@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: REGRESSION for the 031 purchase-time FIFO guard on
+-- stonescriptphp-payments :: REGRESSION for the 031 purchase-time FIFO guard on
 -- get_customer_credit_balance (the fix to the latent original-003 bug — see
 -- the note on src/Pricing/Schema/functions/003_12_get_customer_credit_balance.pgsql,
 -- restored at the 2026-09-22 merge). Runs right after 031's deployable .pgsql

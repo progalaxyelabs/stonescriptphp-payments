@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stonescriptphp-pay :: SQL test-suite / schema-deploy runner.
+# stonescriptphp-payments :: SQL test-suite / schema-deploy runner.
 #
 # Loads the module's SQL into a database in the ONE canonical order (numeric
 # filename prefix, ascending, across every src/**/*.pgsql — bucketed

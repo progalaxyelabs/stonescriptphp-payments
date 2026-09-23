@@ -1,5 +1,5 @@
--- package: progalaxyelabs/stonescriptphp-payments (merged from stonescriptphp-pay + stonescriptphp-invoice) v0.1.0
--- stonescriptphp-pay :: Pricing :: functions :: get_customer_credit_balance — RESTORED
+-- package: progalaxyelabs/stonescriptphp-payments (merged from stonescriptphp-payments + stonescriptphp-invoice) v0.1.0
+-- stonescriptphp-payments :: Pricing :: functions :: get_customer_credit_balance — RESTORED
 -- at the 2026-09-22 merge. The 2026-09-14 SCOPE->BUCKET layout migration split
 -- 003_pricing_functions.pgsql into per-object files but DROPPED this function's
 -- original (pre-031-fix) definition entirely — 031_01_get_customer_credit_balance.pgsql
@@ -14,7 +14,7 @@
 -- every other adopting platform's actual deploy order always required.
 --
 -- Identity columns updated to tenant_id UUID + platform_code VARCHAR(50) (matching
--- progalaxyelabs-auth's tenant_memberships shape 1:1) per the 2026-09-22 identity merge —
+-- the auth service's tenant_memberships shape 1:1) per the 2026-09-22 identity merge —
 -- no other behavior changed from the original body.
 
 -- Balance as of any given date, computed fresh from raw facts every time —

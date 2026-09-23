@@ -61,7 +61,7 @@ CREATE TABLE inv_invoices (
     invoice_number          TEXT NOT NULL UNIQUE,   -- [MINIMAL] length/charset-valid (validated by 027 at issue)
 
     -- --- tenant identity ---
-    -- Mirrors progalaxyelabs-auth's own tenant_memberships shape 1:1
+    -- Mirrors the auth service's own tenant_memberships shape 1:1
     -- (tenant_id UUID + platform_code VARCHAR(50) — same names, same
     -- types). Opaque values resolved from the caller's JWT/auth service —
     -- NEVER a cross-DB FK (auth lives in a separate database/schema; see

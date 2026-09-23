@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: prove the credit/refund ledger end to end (Case 7).
+-- stonescriptphp-payments :: prove the credit/refund ledger end to end (Case 7).
 -- Heidi subscribes Annual, switches to Monthly mid-year — renew computes a
 -- prorated credit and RETURNS it; we BANK it (via \gset, exactly as an app
 -- would thread the returned value), draw it down against monthly charges, add

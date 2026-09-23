@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: an example prepaid wallet — the PRIORITY case.
+-- stonescriptphp-payments :: an example prepaid wallet — the PRIORITY case.
 -- Proves Case 1 (wallet drained by a metered per-SKU RATE), Case 2
 -- (variable-amount top-up + minimum floor), Case 3 (recurring/free grants,
 -- idempotent), plus expiry/forfeiture, sufficiency gating, and no-grandfather

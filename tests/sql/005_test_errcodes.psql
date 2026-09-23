@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: verify the 4 custom SQLSTATEs are really attached
+-- stonescriptphp-payments :: verify the 4 custom SQLSTATEs are really attached
 \set VERBOSITY verbose
 \set bob_tenant   '''00000000-0000-0000-0000-000000000002'''
 \set platform     '''testplatform'''

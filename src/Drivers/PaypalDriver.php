@@ -22,7 +22,7 @@ use StoneScriptPay\Exceptions\WebhookException;
 /**
  * PayPal payment driver — PayPal Orders v2 REST API. Zero SDK, raw curl,
  * ported from a live bespoke client (create-order / capture-order /
- * webhook-signature-verification) that predates `stonescriptphp-pay` —
+ * webhook-signature-verification) that predates `stonescriptphp-payments` —
  * this is its natural home now that a shared payment contract exists.
  *
  * *** verifySignature() IS NOT SIDE-EFFECT-FREE FOR THIS DRIVER ***

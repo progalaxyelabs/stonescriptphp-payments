@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: TEST — persisted invoices + payments + gateway routing +
+-- stonescriptphp-payments :: TEST — persisted invoices + payments + gateway routing +
 --   status lifecycle + duplicate-payment guard + CRM chase subset.
 -- Run with ON_ERROR_STOP=0. Positive assertions print  ok_* = t  (actual vs the
 -- hand-derived number in the \echo above them). Negative cases are DO blocks that

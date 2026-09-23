@@ -1,5 +1,5 @@
--- package: progalaxyelabs/stonescriptphp-payments (merged from stonescriptphp-pay + stonescriptphp-invoice) v0.1.0
--- stonescriptphp-pay :: Tax :: functions :: inv_resolve_tax_scheme
+-- package: progalaxyelabs/stonescriptphp-payments (merged from stonescriptphp-payments + stonescriptphp-invoice) v0.1.0
+-- stonescriptphp-payments :: Tax :: functions :: inv_resolve_tax_scheme
 --
 -- Resolves which tax regime governs a billing country by a plain JOIN on
 -- inv_tax_scheme (033) — mirrors inv_resolve_gateway's (035) own JOIN-based

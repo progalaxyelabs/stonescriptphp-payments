@@ -49,7 +49,7 @@
 -- country routing rule > ER052.
 
 CREATE TABLE inv_customer_gateway_overrides (
-    -- Identity: same shape as progalaxyelabs-auth's tenant_memberships
+    -- Identity: same shape as the auth service's tenant_memberships
     -- (tenant_id UUID + platform_code VARCHAR(50)) — opaque, resolved from
     -- the JWT/auth service, no cross-DB FK, no local "customers" fixture.
     tenant_id       UUID NOT NULL,

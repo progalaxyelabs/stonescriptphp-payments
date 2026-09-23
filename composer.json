@@ -2,7 +2,7 @@
     "name": "progalaxyelabs/stonescriptphp-payments",
     "description": "The unified payment system for StoneScriptPHP — merges what were separately-published stonescriptphp-pay (Razorpay/PayPal transport drivers) and stonescriptphp-invoice (SQL-first billing/invoicing) into one package: gateway drivers, the idempotent payment-capture primitive, and SQL-first subscription/one-time/credit/wallet/consumption/passthrough pricing, invoices, parties, pluggable regional tax computation (ships India GST), gateway routing, and durable transactional-outbox intimation. All business logic lives in PostgreSQL functions deployed via the StoneScriptDB Gateway; PHP is transport only.",
     "type": "library",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "license": "MIT",
     "keywords": [
         "php",

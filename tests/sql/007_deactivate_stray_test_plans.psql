@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: diagnostic — deactivate the old 004/005 illustrative
+-- stonescriptphp-payments :: diagnostic — deactivate the old 004/005 illustrative
 -- test plans (pricing_plan_id 1 'Monthly' and 2 '10-hr Homework Assistant
 -- Pack') now that 006 has seeded the example catalog, and check that
 -- downstream reads still behave correctly when a parent plan is deactivated.

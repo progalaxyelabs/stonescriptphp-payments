@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: prove get_active_pricing_plan() at various as-of dates
+-- stonescriptphp-payments :: prove get_active_pricing_plan() at various as-of dates
 \set alice_tenant '''00000000-0000-0000-0000-000000000001'''
 \set bob_tenant   '''00000000-0000-0000-0000-000000000002'''
 \set carol_tenant '''00000000-0000-0000-0000-000000000003'''

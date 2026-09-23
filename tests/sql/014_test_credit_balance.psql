@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: topups at various times/plans, consumption at random
+-- stonescriptphp-payments :: topups at various times/plans, consumption at random
 -- dates, FIFO-by-expiry depletion, forfeiture of unused expired credits,
 -- balance on any given date, and rejection of over-consumption.
 --

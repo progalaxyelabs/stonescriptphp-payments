@@ -70,7 +70,7 @@
 CREATE TABLE central_minimal_invoices (
     invoice_id            BIGINT PRIMARY KEY,     -- IDEMPOTENCY KEY (comes from the payload; NOT an FK — central is a different DB)
     invoice_number        TEXT NOT NULL,
-    -- Identity: same shape as progalaxyelabs-auth's tenant_memberships
+    -- Identity: same shape as the auth service's tenant_memberships
     -- (tenant_id UUID + platform_code VARCHAR(50)). Copied verbatim from
     -- the product-side inv_invoices row on intimation — NOT an FK (central
     -- is a different DB); central never re-resolves it against auth

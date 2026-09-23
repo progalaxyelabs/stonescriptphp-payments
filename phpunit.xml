@@ -7,7 +7,7 @@
          failOnRisky="false">
 
     <testsuites>
-        <testsuite name="stonescriptphp-pay">
+        <testsuite name="stonescriptphp-payments">
             <directory>tests/Unit</directory>
         </testsuite>
         <testsuite name="stonescriptphp-invoice-php">

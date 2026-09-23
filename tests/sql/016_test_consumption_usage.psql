@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: postpaid consumption billing — enroll once, meter
+-- stonescriptphp-payments :: postpaid consumption billing — enroll once, meter
 -- usage daily across 20-31 July, prove the total charge lands EXACTLY on
 -- ₹12,345.67, then prove a later rate change never rewrites that charge
 -- but DOES apply to all new usage from the moment it takes effect.

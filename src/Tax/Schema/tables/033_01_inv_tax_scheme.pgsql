@@ -1,5 +1,5 @@
--- package: progalaxyelabs/stonescriptphp-payments (merged from stonescriptphp-pay + stonescriptphp-invoice) v0.1.0
--- stonescriptphp-pay :: Tax :: tables :: inv_tax_scheme — the country-agnostic
+-- package: progalaxyelabs/stonescriptphp-payments (merged from stonescriptphp-payments + stonescriptphp-invoice) v0.1.0
+-- stonescriptphp-payments :: Tax :: tables :: inv_tax_scheme — the country-agnostic
 -- "which tax regime applies" resolution DATA, added at the 2026-09-22 merge.
 --
 -- WHY THIS EXISTS: the ecosystem's standing law (matching inv_resolve_gateway,

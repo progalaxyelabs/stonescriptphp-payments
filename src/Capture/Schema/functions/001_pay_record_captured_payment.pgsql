@@ -1,5 +1,5 @@
--- package: progalaxyelabs/stonescriptphp-pay v0.3.0
--- stonescriptphp-pay :: Capture :: functions :: pay_record_captured_payment
+-- package: progalaxyelabs/stonescriptphp-payments
+-- stonescriptphp-payments :: Capture :: functions :: pay_record_captured_payment
 --
 -- Records a VERIFIED gateway capture exactly once. This function is the
 -- entire idempotent-capture primitive's logic — a caller (webhook route ->

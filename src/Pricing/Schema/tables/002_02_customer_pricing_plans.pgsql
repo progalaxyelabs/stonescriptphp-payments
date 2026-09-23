@@ -9,7 +9,7 @@
 
 CREATE TABLE customer_pricing_plans (
     id                            BIGSERIAL PRIMARY KEY,
-    -- Identity: mirrors progalaxyelabs-auth's own tenant_memberships shape
+    -- Identity: mirrors the auth service's own tenant_memberships shape
     -- 1:1 (identity_id/tenant_id/platform_code — same names, same UUID
     -- types). Opaque values resolved from the caller's JWT/auth service —
     -- NEVER a cross-DB FK (auth lives in a separate database/schema; see

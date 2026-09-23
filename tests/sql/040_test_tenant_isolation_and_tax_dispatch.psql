@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: TEST — cross-tenant isolation (ER067) on the pay path
+-- stonescriptphp-payments :: TEST — cross-tenant isolation (ER067) on the pay path
 --   + dynamic tax-scheme dispatch (ER065/ER068), added 2026-09-22.
 -- Run with ON_ERROR_STOP=0. Negative cases are DO blocks that print
 -- 'ok: ERxxx raised' when the intended SQLSTATE fires and 'FAIL: ...'

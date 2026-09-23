@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: TEST/DEMO companion of the postpaid-billing objects.
+-- stonescriptphp-payments :: TEST/DEMO companion of the postpaid-billing objects.
 -- Run with ON_ERROR_STOP=0. This file carries the demo seed data, worked-figure
 -- assertions and the by-design negative (ER*) cases that must NOT ship in the
 -- deployable schema.

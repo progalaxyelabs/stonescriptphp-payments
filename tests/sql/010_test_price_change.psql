@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: pricing change 3 months in — old tenants stay pinned,
+-- stonescriptphp-payments :: pricing change 3 months in — old tenants stay pinned,
 -- new tenants get the new price, the pricing page only ever shows current.
 \set dave_tenant '''00000000-0000-0000-0000-000000000004'''
 \set eve_tenant  '''00000000-0000-0000-0000-000000000005'''

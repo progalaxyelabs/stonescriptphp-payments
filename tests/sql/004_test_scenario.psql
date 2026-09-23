@@ -1,9 +1,9 @@
--- stonescriptphp-pay :: a worked end-to-end scenario
+-- stonescriptphp-payments :: a worked end-to-end scenario
 -- Monthly plan sold at ₹349 from Oct 1; ₹359 price row created Oct 12,
 -- supersedes ₹349. Alice bought before the change, Bob after.
 --
 -- IDENTITY (2026-09-22 merge): tenants are identified by (tenant_id UUID,
--- platform_code VARCHAR(50)) — the SAME shape as progalaxyelabs-auth's own
+-- platform_code VARCHAR(50)) — the SAME shape as the auth service's own
 -- tenant_memberships, resolved from the caller's JWT, never a local
 -- surrogate "customers" row. Test fixtures use fixed, well-known UUIDs so
 -- later files in the suite can reference the same tenant consistently.

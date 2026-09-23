@@ -1,7 +1,7 @@
-# Canonical load order — stonescriptphp-pay (SQL billing side)
+# Canonical load order — stonescriptphp-payments (SQL billing side)
 
 This is the **dependency-ordered set of PostgreSQL migration files** for the
-billing/invoicing/tax side of the merged `stonescriptphp-pay` package (the
+billing/invoicing/tax side of the merged `stonescriptphp-payments` package (the
 `Capture/`, `Pricing/`, `Metering/`, `Tax/India/`, `Invoicing/`, `Outbox/`
 directories under `src/`), not a two-bucket (tables-then-functions) scan.
 Functions depend on earlier functions and on data rows; one file (`031`) is a

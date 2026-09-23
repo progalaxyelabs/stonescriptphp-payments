@@ -1,5 +1,5 @@
--- package: progalaxyelabs/stonescriptphp-pay v0.3.0
--- stonescriptphp-pay :: Capture :: tables :: pay_captured_payments
+-- package: progalaxyelabs/stonescriptphp-payments
+-- stonescriptphp-payments :: Capture :: tables :: pay_captured_payments
 --
 -- THE canonical, safe-by-default idempotent payment-CAPTURE primitive for the
 -- whole StoneScriptPHP ecosystem. StoneScriptPHP is the default runtime a

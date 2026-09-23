@@ -1,4 +1,4 @@
--- stonescriptphp-pay :: prove start_free_trial() + the trial-cancel block
+-- stonescriptphp-payments :: prove start_free_trial() + the trial-cancel block
 \set carol_tenant '''00000000-0000-0000-0000-000000000003'''
 \set platform     '''testplatform'''
 

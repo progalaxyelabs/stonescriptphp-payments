@@ -70,7 +70,7 @@ CREATE OR REPLACE FUNCTION inv_outbox_minimal_payload(p inv_invoices) RETURNS JS
     SELECT jsonb_build_object(
         'invoice_id',            p.id,
         'invoice_number',        p.invoice_number,
-        'tenant_id',             p.tenant_id,          -- opaque, matches progalaxyelabs-auth's own tenant_id (see 034)
+        'tenant_id',             p.tenant_id,          -- opaque, matches the auth service's own tenant_id (see 034)
         'platform_code',         p.platform_code,
         'amount_minor',          p.gross_total_minor,  -- paisa the customer owes, in `currency`
         'currency',              p.currency,

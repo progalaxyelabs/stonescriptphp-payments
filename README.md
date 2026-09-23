@@ -1,4 +1,4 @@
-# stonescriptphp-pay
+# stonescriptphp-payments
 
 The **unified payment system** for [StoneScriptPHP](https://stonescriptphp.org).
 This single package merges what used to be three separately-versioned pieces —
@@ -78,7 +78,7 @@ All SQL schema is the **`main`** scope; a per-tenant scope layer is deferred.
 ## Installation
 
 ```bash
-composer require progalaxyelabs/stonescriptphp-pay
+composer require progalaxyelabs/stonescriptphp-payments
 ```
 
 ## Driver usage

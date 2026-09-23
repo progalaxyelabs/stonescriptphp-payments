@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace StoneScriptPay\Exceptions;
 
 /**
- * Base exception for all payment errors raised by stonescriptphp-pay drivers.
+ * Base exception for all payment errors raised by stonescriptphp-payments drivers.
  *
  * Wraps provider-level errors (network failures, API errors) so consuming code
  * can catch a single type without coupling to provider-specific exception classes.
