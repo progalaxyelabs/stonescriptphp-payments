@@ -27,4 +27,10 @@ INSERT INTO inv_gst_config (config_key, config_value, note) VALUES
     ('title_tax_invoice', 'Tax Invoice', 'Caption for a tax invoice.'),
     ('title_bill_of_supply', 'Bill of Supply', 'Caption for a bill of supply (registered/composition seller).'),
     ('title_unregistered_invoice', 'Invoice',
-        'An unregistered seller''s document is a plain commercial invoice, not a tax-caption document.');
+        'An unregistered seller''s document is a plain commercial invoice, not a tax-caption document.'),
+    ('legacy_rate_slabs', '0.12,0.28',
+        'Slabs still accepted for historical documents but retired for new ones (GST 2.0). CA to confirm.'),
+    ('issue_date_window_days_live', '0',
+        'A LIVE series-numbered invoice must be dated today (IST) +/- this many days: 0 = the current IST calendar day only. Live documents are dated when they are issued; history comes in through the explicit-number import path, which is exempt.'),
+    ('issue_date_window_days_test', '7',
+        'The same window for TEST series, wider so sandbox flows and demos can post-date or back-date. A test document carries a TEST number and never reaches the books.');

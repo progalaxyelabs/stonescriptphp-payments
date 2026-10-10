@@ -1521,6 +1521,76 @@ END $D$;
 SELECT inv_assert_eq('INV10.statutory_inr_paisa (75.00 x 95.7245)', (inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','75.00')), 717934);
 SELECT inv_assert_text_eq('INV10.statutory_inr_str', (inv_money_to_decimal_string(inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','75.00'))), '7179.34');
 
+
+\echo '=== ACCEPTED DIVERGENCES FROM THE PHP ORACLE (CGST/SGST remainder rule) ==='
+-- The PHP reference rounds CGST and SGST independently (each half-up of half the line's tax), which bills
+-- ONE PAISA TOO MUCH whenever a line's total tax is odd. Since L7 the SQL engine rounds the line's TOTAL tax once,
+-- gives CGST the half-up half and SGST the remainder, so the heads always sum to the rounded total. The oracle
+-- values above are left untouched; exactly these 56 (label, new value) pairs are the intended divergence.
+-- A divergence not listed here, or a listed one with a different value, still FAILS the tally.
+-- [CA TO CONFIRM: an unequal CGST/SGST split of one paisa is acceptable on a tax invoice.]
+CREATE TEMP TABLE _inv_diff_accepted(label text, actual text, oracle text);
+INSERT INTO _inv_diff_accepted VALUES
+    ('H2.sgst', '108741', '108742'),
+    ('H2.gross', '1425723', '1425724'),
+    ('H2.gross_str', '14257.23', '14257.24'),
+    ('H2.L1.sgst', '108741', '108742'),
+    ('H2.L1.line_total', '1425723', '1425724'),
+    ('H2.L1.line_total_str', '14257.23', '14257.24'),
+    ('IP3_9999.taxable', '8928', '8927'),
+    ('IP3_9999.sgst', '535', '536'),
+    ('IP3_9999.taxable_str', '89.28', '89.27'),
+    ('IP3_9999.L1.taxable', '8928', '8927'),
+    ('IP3_9999.L1.sgst', '535', '536'),
+    ('IP3_9999.L1.taxable_str', '89.28', '89.27'),
+    ('IP4_multiline.taxable', '23123', '23121'),
+    ('IP4_multiline.sgst', '1812', '1814'),
+    ('IP4_multiline.taxable_str', '231.23', '231.21'),
+    ('IP4_multiline.L1.taxable', '8928', '8927'),
+    ('IP4_multiline.L1.sgst', '535', '536'),
+    ('IP4_multiline.L1.taxable_str', '89.28', '89.27'),
+    ('IP4_multiline.L2.taxable', '4195', '4194'),
+    ('IP4_multiline.L2.sgst', '377', '378'),
+    ('IP4_multiline.L2.taxable_str', '41.95', '41.94'),
+    ('R1_5006.sgst', '450', '451'),
+    ('R1_5006.gross', '5907', '5908'),
+    ('R1_5006.gross_str', '59.07', '59.08'),
+    ('R1_5006.L1.sgst', '450', '451'),
+    ('R1_5006.L1.line_total', '5907', '5908'),
+    ('R1_5006.L1.line_total_str', '59.07', '59.08'),
+    ('R3_1210_5pct.sgst', '30', '31'),
+    ('R3_1210_5pct.gross', '1271', '1272'),
+    ('R3_1210_5pct.gross_str', '12.71', '12.72'),
+    ('R3_1210_5pct.L1.sgst', '30', '31'),
+    ('R3_1210_5pct.L1.line_total', '1271', '1272'),
+    ('R3_1210_5pct.L1.line_total_str', '12.71', '12.72'),
+    ('R4_590_12pct.sgst', '35', '36'),
+    ('R4_590_12pct.gross', '661', '662'),
+    ('R4_590_12pct.gross_str', '6.61', '6.62'),
+    ('R4_590_12pct.L1.sgst', '35', '36'),
+    ('R4_590_12pct.L1.line_total', '661', '662'),
+    ('R4_590_12pct.L1.line_total_str', '6.61', '6.62'),
+    ('R5_roundoff.sgst', '450', '451'),
+    ('R5_roundoff.round_off', '-7', '-8'),
+    ('R5_roundoff.L1.sgst', '450', '451'),
+    ('R5_roundoff.L1.line_total', '5907', '5908'),
+    ('R5_roundoff.L1.line_total_str', '59.07', '59.08'),
+    ('R7_multiline_oddpaisa.sgst', '650', '651'),
+    ('R7_multiline_oddpaisa.gross', '9640', '9641'),
+    ('R7_multiline_oddpaisa.gross_str', '96.40', '96.41'),
+    ('R7_multiline_oddpaisa.L1.sgst', '450', '451'),
+    ('R7_multiline_oddpaisa.L1.line_total', '5907', '5908'),
+    ('R7_multiline_oddpaisa.L1.line_total_str', '59.07', '59.08'),
+    ('RP_quantity_0333.sgst', '2697', '2698'),
+    ('RP_quantity_0333.gross', '35365', '35366'),
+    ('RP_quantity_0333.gross_str', '353.65', '353.66'),
+    ('RP_quantity_0333.L1.sgst', '2697', '2698'),
+    ('RP_quantity_0333.L1.line_total', '35365', '35366'),
+    ('RP_quantity_0333.L1.line_total_str', '353.65', '353.66');
+UPDATE _inv_diff_results r SET passed = true, expected = r.expected || ' (oracle; accepted divergence)'
+  FROM _inv_diff_accepted a WHERE NOT r.passed AND r.label = a.label AND r.actual = a.actual AND r.expected = a.oracle;
+SELECT count(*) AS accepted_divergences FROM _inv_diff_results WHERE expected LIKE '%accepted divergence)';
+
 \echo '=== DIFFERENTIAL TALLY (expect failed = 0) ==='
 SELECT count(*) AS total, count(*) FILTER (WHERE passed) AS passed, count(*) FILTER (WHERE NOT passed) AS failed FROM _inv_diff_results;
 \echo '=== ANY FAILURES BELOW (none expected) ==='

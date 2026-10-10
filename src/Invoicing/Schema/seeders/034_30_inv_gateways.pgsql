@@ -39,10 +39,14 @@
 --   ER060  billing_country_code is required and must be a 2-letter code    -> 400
 --   ER061  invalid payment status value (expected 'success' | 'failed')    -> 400
 
+-- Seeded INACTIVE on purpose: the checkout_endpoint below is a placeholder, and a gateway that is
+-- active with a placeholder endpoint would be routed to in production. A deployment sets its real
+-- endpoint and then activates the gateways it uses (UPDATE inv_gateways SET checkout_endpoint = ...,
+-- is_active = true WHERE code = ...). _pay_ensure_reference_data() never changes a row that exists.
 INSERT INTO inv_gateways (code, display_name, settlement_currency, checkout_endpoint, is_active, created_at, created_by) VALUES
     ('razorpay', 'Razorpay',
         'INR', 'https://pay.example.com',
-        true, '2026-01-01', 'seed'),   -- example central pay domain (adopter should override this row); Razorpay Standard Checkout
+        false, '2026-01-01', 'seed'),   -- example central pay domain (adopter MUST override this row); Razorpay Standard Checkout
     ('paypal', 'PayPal',
         'USD', 'https://www.paypal.com/invoice',
-        true, '2026-01-01', 'seed');   -- PayPal hosted-invoice basis (export services only, for now)
+        false, '2026-01-01', 'seed');   -- PayPal hosted-invoice basis (export services only, for now)

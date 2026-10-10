@@ -1,0 +1,6 @@
+-- TEST FIXTURE ONLY. The package seeds its gateways INACTIVE (their checkout endpoint is a
+-- placeholder). The scenario tests below route and settle through them, so the test database
+-- activates them here, right after the seeders. Never do this in a deployment without setting the
+-- real endpoint first.
+\set ON_ERROR_STOP on
+UPDATE inv_gateways SET is_active = true;

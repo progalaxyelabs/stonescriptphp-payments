@@ -1,0 +1,117 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Operator and scheduler tool for the wallet. Run on the server with the platform's DIRECT database credentials (the bootstrap file), never through
+ * the gateway's /call (the functions it drives are internal and /call refuses them).
+ *
+ *   pay-wallet <command> --bootstrap=FILE [options]
+ *
+ *   grant-free     --tenant --platform --key --milli --actor --reason [--expires-at=ISO]   promotional credit (idempotent per key)
+ *   create-pack    --plan=PRICING_PLAN_ID --name --credits-milli --actor [--validity-duration --validity-uom=day|month|year]
+ *   import-opening --rows=@FILE --scale=N --actor        legacy balances [{tenant_id,platform_code,credits}], credits x N = milli-credits
+ *   verify-opening --rows=@FILE --scale=N                the reconciliation gate: exits 1 unless the wallets equal the legacy balances
+ *   mark-migrated  --platform --actor                    retire the v1 wallet functions for the platform
+ *   expire         [--batch=100] [--as-of=ISO]           forfeit expired credit, one wallet per transaction (cron)
+ *   close-meter    --tenant --platform --meter-key --actor   retire a meter (a reset or a rate change starts a NEW meter key)
+ *   verify-ledger                                        run ledger_verify; exits 1 on any violation (cron)
+ *
+ * Every mutating command REQUIRES --actor (audit trail and stderr). The bootstrap file RETURNS a configured
+ * StoneScriptPay\Http\Wallet\WalletOperations.
+ */
+
+use StoneScriptPay\Http\Wallet\WalletOperations;
+
+$cmd = $argv[1] ?? '';
+// PHP's getopt() stops at the first non-option argument, which here is the command, so the options after the command are parsed by hand:
+// --name=value, or a bare --flag (true). Anything else is a usage error.
+$parseArgs = static function (array $args): array {
+    $o = [];
+    foreach ($args as $a) {
+        if (preg_match('/^--([a-z][a-z0-9-]*)(?:=(.*))?$/s', (string) $a, $m) !== 1) {
+            fwrite(STDERR, "unexpected argument \"$a\": options are --name=value or --flag
+");
+            exit(1);
+        }
+        $o[$m[1]] = array_key_exists(2, $m) ? $m[2] : true;
+    }
+
+    return $o;
+};
+$o = $parseArgs(array_slice($argv, 2));
+$usage = static function (string $why): never {
+    fwrite(STDERR, "pay-wallet: $why\nsee the header of bin/pay-wallet for the commands and options\n");
+    exit(1);
+};
+$need = static function (array $names) use ($o, $usage): void {
+    foreach ($names as $n) {
+        if (!isset($o[$n]) || !is_string($o[$n]) || trim($o[$n]) === '') {
+            $usage("missing --$n");
+        }
+    }
+};
+$need(['bootstrap']);
+if (!is_file($o['bootstrap'])) {
+    $usage('bootstrap file not found');
+}
+$ops = require $o['bootstrap'];
+if (!$ops instanceof WalletOperations) {
+    $usage('the bootstrap file must return a ' . WalletOperations::class);
+}
+$rows = static function () use ($o, $usage): array {
+    $raw = str_starts_with((string) $o['rows'], '@') ? (string) @file_get_contents(substr((string) $o['rows'], 1)) : (string) $o['rows'];
+    $d = json_decode($raw, true);
+    if (!is_array($d)) {
+        $usage('--rows must be a JSON array (or @file)');
+    }
+
+    return $d;
+};
+try {
+    switch ($cmd) {
+        case 'grant-free':
+            $need(['tenant', 'platform', 'key', 'milli', 'actor', 'reason']);
+            $r = $ops->grantFree($o['tenant'], $o['platform'], $o['key'], (int) $o['milli'], $o['actor'], $o['reason'], $o['expires-at'] ?? null);
+            break;
+        case 'create-pack':
+            $need(['plan', 'name', 'credits-milli', 'actor']);
+            $r = ['pack_id' => $ops->createPack((int) $o['plan'], $o['name'], (int) $o['credits-milli'],
+                isset($o['validity-duration']) ? (int) $o['validity-duration'] : null, $o['validity-uom'] ?? null, $o['actor'])];
+            break;
+        case 'import-opening':
+            $need(['rows', 'scale', 'actor']);
+            $r = $ops->importOpening($rows(), (int) $o['scale'], $o['actor']);
+            break;
+        case 'verify-opening':
+            $need(['rows', 'scale']);
+            $diff = $ops->verifyOpening($rows(), (int) $o['scale']);
+            echo json_encode(['differences' => $diff], JSON_THROW_ON_ERROR) . "\n";
+            exit($diff === [] ? 0 : 1);
+        case 'mark-migrated':
+            $need(['platform', 'actor']);
+            $r = ['result' => $ops->markPlatformMigrated($o['platform'], $o['actor'])];
+            break;
+        case 'close-meter':
+            $need(['tenant', 'platform', 'meter-key', 'actor']);
+            $r = ['closed' => $ops->closeMeter($o['tenant'], $o['platform'], $o['meter-key'], $o['actor'])];
+            break;
+        case 'verify-ledger':
+            $v = $ops->verifyLedger();
+            echo json_encode(['violations' => $v], JSON_THROW_ON_ERROR) . "\n";
+            exit($v === [] ? 0 : 1);
+        case 'expire':
+            $r = $ops->expire($o['as-of'] ?? null, isset($o['batch']) ? max(1, (int) $o['batch']) : 100);
+            break;
+        default:
+            $usage('unknown command "' . $cmd . '"');
+    }
+} catch (\InvalidArgumentException $e) {
+    $usage($e->getMessage());
+} catch (\Throwable $e) {
+    fwrite(STDERR, 'pay-wallet: refused: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+echo json_encode($r, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n";
+exit(0);

@@ -1,0 +1,226 @@
+-- stonescriptphp-payments :: TEST - the durable webhook inbox (L7.2): record / claim / mark /
+-- replay candidates / guards. STRICT: sets ON_ERROR_STOP itself; the first failed assertion
+-- aborts with a non-zero exit and fails tests/run-suite.sh. Concurrency proofs are in
+-- tests/shell/l7_2_webhook_inbox.sh; the PHP ingress is tested in tests/Unit/Http.
+\set ON_ERROR_STOP on
+
+CREATE FUNCTION pg_temp.t_assert(p_ok BOOLEAN, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    IF p_ok IS NOT TRUE THEN RAISE EXCEPTION 'ASSERTION FAILED: %', p_label; END IF;
+    RAISE NOTICE 'ok: %', p_label;
+END; $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pg_temp.t_expect(p_sql TEXT, p_state TEXT, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    BEGIN
+        EXECUTE p_sql;
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE = p_state THEN RAISE NOTICE 'ok: % (raised %)', p_label, p_state; RETURN; END IF;
+        RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but got % (%)', p_label, p_state, SQLSTATE, SQLERRM;
+    END;
+    RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but nothing was raised', p_label, p_state;
+END; $$ LANGUAGE plpgsql;
+
+\echo '======== record: the durability point ========'
+SELECT o_id AS e1 FROM pay_webhook_record('razorpay', 'evt_1', 'payment.captured', 'plat', '{"event":"payment.captured"}',
+    '{"Content-Type":"application/json","x-razorpay-event-id":"evt_1","X-Razorpay-Signature":"abc","Authorization":"Bearer s","Cookie":"c","paypal-transmission-sig":"s","x-api-key":"k"}',
+    '{"type":"payment.captured"}') \gset
+SELECT pg_temp.t_assert((SELECT status = 'received' AND attempts = 0 AND event_type = 'payment.captured' AND platform_code = 'plat'
+                                AND event->>'type' = 'payment.captured' AND signature_verified AND locked_until IS NULL
+                           FROM pay_webhook_inbox WHERE id = :e1), 'a new event is stored as received with its normalised event');
+SELECT pg_temp.t_assert((SELECT headers ? 'content-type' AND headers ? 'x-razorpay-event-id'
+                                AND NOT (headers ? 'x-razorpay-signature') AND NOT (headers ? 'authorization') AND NOT (headers ? 'cookie')
+                                AND NOT (headers ? 'paypal-transmission-sig') AND NOT (headers ? 'x-api-key')
+                           FROM pay_webhook_inbox WHERE id = :e1), 'credential- and signature-looking headers are redacted, the rest kept');
+SELECT pg_temp.t_assert((SELECT o_is_new = false AND o_id = :e1 AND o_status = 'received' AND o_should_alert = false
+                           FROM pay_webhook_record('razorpay', 'evt_1', 'payment.captured', 'plat', '{"x":1}', '{}', NULL)),
+    'a redelivered event id is a no-op: same row, not new');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(raw_body) = '{"event":"payment.captured"}' FROM pay_webhook_inbox WHERE event_id = 'evt_1'),
+    'still exactly one row, and the original raw body is kept');
+SELECT pg_temp.t_assert((SELECT o_is_new FROM pay_webhook_record('paypal', 'evt_1', NULL, NULL, '{}', '{}', NULL)),
+    'the same event id on another gateway is a different event');
+-- signed but unreadable body: stored raw as failed, alert-worthy exactly once
+SELECT o_id AS m1, o_should_alert AS m1_alert FROM pay_webhook_record('razorpay', 'evt_bad', NULL, NULL, '{not json', '{}', NULL, 'failed', 'webhook body is not valid JSON') \gset
+SELECT pg_temp.t_assert((SELECT status = 'failed' AND raw_body = '{not json' AND event IS NULL AND last_error LIKE '%not valid JSON%' AND alert_raised_at IS NULL
+                                AND body_sha256 = encode(sha256(convert_to('{not json', 'UTF8')), 'hex')
+                           FROM pay_webhook_inbox WHERE id = :m1), 'a signed but malformed body is stored raw as failed, hashed, its alert not yet stamped');
+SELECT pg_temp.t_assert(:'m1_alert'::boolean, 'the malformed body asks for an alert on creation');
+SELECT pg_temp.t_assert((SELECT o_should_alert = false AND o_is_new = false FROM pay_webhook_record('razorpay', 'evt_bad', NULL, NULL, '{not json', '{}', NULL, 'failed', 'x')),
+    'its redelivery does not alert again');
+SELECT pg_temp.t_expect($$SELECT * FROM pay_webhook_record('razorpay', '', NULL, NULL, '{}', '{}', NULL)$$, 'PY020', 'an empty event id is refused');
+SELECT pg_temp.t_expect($$SELECT * FROM pay_webhook_record('razorpay', 'evt_x', NULL, NULL, '{}', '{}', NULL, 'applied')$$, 'PY020', 'a new event cannot be stored as already applied');
+SELECT pg_temp.t_expect($$INSERT INTO pay_webhook_inbox (gateway_code, event_id, raw_body, body_sha256, status, signature_verified) VALUES ('razorpay', 'unverified', '{}', 'x', 'received', false)$$,
+    '23514', 'an unverified event can never be stored');
+SELECT pg_temp.t_expect($$INSERT INTO pay_webhook_inbox (gateway_code, event_id, raw_body, body_sha256, status) VALUES ('razorpay', 'weird', '{}', 'x', 'bogus')$$, '23514', 'the status set is closed');
+
+\echo '======== claim: one worker at a time ========'
+SELECT pg_temp.t_assert((SELECT o_attempts = 1 AND o_status = 'received' AND o_event::jsonb->>'type' = 'payment.captured' AND o_raw_body = '{"event":"payment.captured"}'
+                           FROM pay_webhook_claim(:e1)), 'claim returns the row, counts the attempt and returns the event as JSON text');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_webhook_claim(:e1)), 'a leased row cannot be claimed again');
+SELECT pg_temp.t_assert((SELECT locked_until > now() FROM pay_webhook_inbox WHERE id = :e1), 'the lease is in the future');
+
+\echo '======== mark: outcomes, finality, alert once ========'
+SELECT pg_temp.t_assert((SELECT o_status = 'applied' AND o_should_alert = false AND o_alert_kind IS NULL FROM pay_webhook_mark(:e1, 'applied')), 'applied: no alert');
+SELECT pg_temp.t_assert((SELECT status = 'applied' AND applied_at IS NOT NULL AND locked_until IS NULL AND last_error IS NULL FROM pay_webhook_inbox WHERE id = :e1),
+    'applied stamps applied_at and releases the lease');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_webhook_claim(:e1)), 'an applied row is final: not claimable');
+SELECT pg_temp.t_expect(format('SELECT * FROM pay_webhook_mark(%s, ''failed'', ''boom'')', :e1), 'PY021', 'an applied row cannot change status');
+SELECT pg_temp.t_assert((SELECT o_status = 'applied' FROM pay_webhook_mark(:e1, 'applied')), 'marking applied again is idempotent');
+SELECT pg_temp.t_expect(format('SELECT * FROM pay_webhook_mark(%s, ''nonsense'')', :e1), 'PY020', 'an invalid status is refused');
+SELECT pg_temp.t_expect($$SELECT * FROM pay_webhook_mark(999999999, 'applied')$$, 'PY020', 'an unknown row is refused');
+
+SELECT o_id AS f1 FROM pay_webhook_record('razorpay', 'evt_fail', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:f1);
+SELECT pg_temp.t_assert((SELECT o_status = 'failed' AND o_should_alert = true AND o_alert_kind = 'webhook.failed' FROM pay_webhook_mark(:f1, 'failed', 'db down')), 'the first failure makes a failed alert due');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id = :f1;
+SELECT * FROM pay_webhook_claim(:f1);
+SELECT pg_temp.t_assert((SELECT o_should_alert = true AND o_alert_kind = 'webhook.failed' FROM pay_webhook_mark(:f1, 'failed', 'db still down')),
+    'until the sink reports success the alert stays due (it is NOT consumed by being asked about)');
+SELECT pg_temp.t_assert((SELECT alert_raised_at IS NULL FROM pay_webhook_inbox WHERE id = :f1), 'alert_raised_at is not stamped by mark');
+SELECT pay_webhook_alert_sent(:f1, 'webhook.failed');
+SELECT pg_temp.t_assert((SELECT alert_raised_at IS NOT NULL FROM pay_webhook_inbox WHERE id = :f1), 'pay_webhook_alert_sent stamps it');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id = :f1;
+SELECT * FROM pay_webhook_claim(:f1);
+SELECT pg_temp.t_assert((SELECT o_should_alert = false FROM pay_webhook_mark(:f1, 'failed', 'again')), 'once stamped, the next failure does not alert again (alert once)');
+SELECT pg_temp.t_assert((SELECT attempts = 3 AND last_error = 'again' FROM pay_webhook_inbox WHERE id = :f1), 'attempts and the latest error are tracked');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id = :f1;
+SELECT * FROM pay_webhook_claim(:f1);
+SELECT pg_temp.t_assert((SELECT o_status = 'applied' FROM pay_webhook_mark(:f1, 'applied')), 'a failed row can still be applied by a later attempt');
+SELECT pg_temp.t_assert((SELECT last_error IS NULL FROM pay_webhook_inbox WHERE id = :f1), 'a successful outcome clears the error');
+
+SELECT o_id AS u1 FROM pay_webhook_record('razorpay', 'evt_unattr', 'payment.captured', NULL, '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:u1);
+SELECT pg_temp.t_assert((SELECT o_should_alert = true AND o_alert_kind = 'webhook.unattributed' FROM pay_webhook_mark(:u1, 'unattributed', 'no routing key')), 'unattributed makes an alert due the first time');
+SELECT pay_webhook_alert_sent(:u1, 'webhook.unattributed');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id = :u1;
+SELECT * FROM pay_webhook_claim(:u1);
+SELECT pg_temp.t_assert((SELECT o_should_alert = false FROM pay_webhook_mark(:u1, 'unattributed', 'still none')), 'unattributed does not alert twice');
+
+SELECT o_id AS o1 FROM pay_webhook_record('razorpay', 'evt_foreign', 'payment.captured', 'other', '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:o1);
+SELECT pg_temp.t_assert((SELECT o_status = 'foreign' AND o_should_alert = false FROM pay_webhook_mark(:o1, 'foreign', NULL, 'other')), 'a foreign event is recorded and never alerts');
+SELECT pg_temp.t_assert((SELECT status = 'foreign' AND platform_code = 'other' FROM pay_webhook_inbox WHERE id = :o1), 'the routing key is kept');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_webhook_claim(:o1)), 'a foreign row is final');
+
+\echo '======== replay candidates ========'
+SELECT o_id AS r_failed FROM pay_webhook_record('razorpay', 'evt_replay_failed', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:r_failed);
+SELECT * FROM pay_webhook_mark(:r_failed, 'failed', 'x');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id IN (:r_failed, :u1);
+SELECT o_id AS r_recv FROM pay_webhook_record('razorpay', 'evt_replay_stale', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+SELECT o_id AS r_leased FROM pay_webhook_record('razorpay', 'evt_replay_leased', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:r_leased);
+SELECT pg_temp.t_assert(EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :r_failed), 'a failed row is a replay candidate');
+SELECT pg_temp.t_assert(EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :u1), 'an unattributed row is a replay candidate');
+SELECT pg_temp.t_assert(EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :r_recv), 'a stale received row (interrupted processing) is a replay candidate');
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 3600) WHERE o_id = :r_recv), 'a fresh received row is not yet a candidate');
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :r_leased), 'a row whose lease is held is not a candidate');
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id IN (:e1, :o1, :f1)), 'applied and foreign rows are never candidates');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_webhook_replay_candidates(1, 0)), 'the limit is honoured');
+SELECT pg_temp.t_assert((SELECT o_id FROM pay_webhook_replay_candidates(100, 0) ORDER BY o_received_at, o_id LIMIT 1) = (SELECT o_id FROM pay_webhook_replay_candidates(1, 0)),
+    'oldest first');
+
+\echo '======== review fixes: requeue restores the alert budget ========'
+SELECT o_id AS rq1 FROM pay_webhook_record('razorpay', 'evt_requeue_alert', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+UPDATE pay_config SET config_value = '1' WHERE config_key = 'webhook_max_attempts';
+SELECT * FROM pay_webhook_claim(:rq1);
+SELECT pg_temp.t_assert((SELECT o_status = 'dead' AND o_alert_kind = 'webhook.dead' FROM pay_webhook_mark(:rq1, 'failed', 'x')), 'the row dies on its first attempt (budget 1)');
+SELECT pay_webhook_alert_sent(:rq1, 'webhook.dead');
+SELECT pay_webhook_alert_sent(:rq1, 'webhook.failed');
+SELECT pg_temp.t_assert((SELECT alert_raised_at IS NOT NULL AND dead_alert_raised_at IS NOT NULL FROM pay_webhook_inbox WHERE id = :rq1), 'both alert stamps are set');
+SELECT _pay_webhook_requeue(:rq1, 'ops', 'fixed');
+SELECT pg_temp.t_assert((SELECT alert_raised_at IS NULL AND dead_alert_raised_at IS NULL AND attempts = 0 FROM pay_webhook_inbox WHERE id = :rq1), 'requeue clears both alert stamps and the attempts');
+SELECT * FROM pay_webhook_claim(:rq1);
+SELECT pg_temp.t_assert((SELECT o_status = 'dead' AND o_alert_kind = 'webhook.dead' FROM pay_webhook_mark(:rq1, 'failed', 'again')), 'a requeued row that dies again makes a dead alert due again');
+UPDATE pay_config SET config_value = '8' WHERE config_key = 'webhook_max_attempts';
+
+\echo '======== retained records ========'
+SELECT pg_temp.t_expect(format('DELETE FROM pay_webhook_inbox WHERE id = %s', :e1), 'PY022', 'an inbox row cannot be deleted');
+SELECT pg_temp.t_expect(format('UPDATE pay_webhook_inbox SET raw_body = ''{}'' WHERE id = %s', :e1), 'PY022', 'the raw body never changes');
+SELECT pg_temp.t_expect(format('UPDATE pay_webhook_inbox SET event_id = ''other'' WHERE id = %s', :e1), 'PY022', 'the event id never changes');
+SELECT pg_temp.t_expect(format('UPDATE pay_webhook_inbox SET event = ''{}''::jsonb WHERE id = %s', :e1), 'PY022', 'the stored event never changes');
+SELECT pg_temp.t_expect(format('UPDATE pay_webhook_inbox SET headers = ''{}''::jsonb WHERE id = %s', :e1), 'PY022', 'the stored headers never change');
+
+
+\echo '======== review fixes: backoff, dead rows, replay order ========'
+SELECT pg_temp.t_assert(_pay_config_int('webhook_max_attempts') = 8 AND _pay_config_int('raw_payload_retention_months') = 13
+                        AND _pay_config_int('accounting_record_retention_years') = 8, 'the documented defaults are configuration rows (13 months, 8 years, 8 attempts)');
+SELECT pg_temp.t_expect($$SELECT _pay_config_int('nope')$$, 'PY050', 'a missing setting is an error, never a silent default');
+UPDATE pay_config SET config_value = '3' WHERE config_key = 'webhook_max_attempts';
+SELECT o_id AS d1 FROM pay_webhook_record('razorpay', 'evt_dead', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:d1);
+SELECT pg_temp.t_assert((SELECT o_status = 'failed' FROM pay_webhook_mark(:d1, 'failed', 'one')), 'attempt 1 fails: still failed');
+SELECT pg_temp.t_assert((SELECT locked_until > now() + interval '30 seconds' AND locked_until < now() + interval '2 minutes' FROM pay_webhook_inbox WHERE id = :d1),
+    'the retry is held back by backoff (about base * 2^0 = 60s)');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_webhook_claim(:d1)) AND NOT EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :d1),
+    'during backoff the row can neither be claimed nor is it a replay candidate');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id = :d1;
+SELECT * FROM pay_webhook_claim(:d1);
+SELECT * FROM pay_webhook_mark(:d1, 'failed', 'two');
+SELECT pg_temp.t_assert((SELECT locked_until > now() + interval '90 seconds' AND locked_until < now() + interval '4 minutes' FROM pay_webhook_inbox WHERE id = :d1), 'the delay doubles (about 120s)');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id = :d1;
+SELECT * FROM pay_webhook_claim(:d1);
+SELECT pg_temp.t_assert((SELECT o_status = 'dead' AND o_alert_kind = 'webhook.dead' AND o_should_alert FROM pay_webhook_mark(:d1, 'failed', 'three')), 'the third failed attempt makes the row DEAD, with a dead alert due');
+SELECT pg_temp.t_assert((SELECT status = 'dead' AND locked_until IS NULL FROM pay_webhook_inbox WHERE id = :d1), 'dead is terminal');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_webhook_claim(:d1)) AND NOT EXISTS (SELECT 1 FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :d1), 'a dead row is never claimed nor replayed');
+SELECT pg_temp.t_expect(format('SELECT * FROM pay_webhook_mark(%s, ''applied'')', :d1), 'PY021', 'a dead row cannot be marked applied behind the back');
+SELECT pay_webhook_alert_sent(:d1, 'webhook.dead');
+SELECT pg_temp.t_assert((SELECT dead_alert_raised_at IS NOT NULL FROM pay_webhook_inbox WHERE id = :d1), 'the dead alert is stamped separately, after delivery');
+UPDATE pay_config SET config_value = '8' WHERE config_key = 'webhook_max_attempts';
+-- age also kills: an old row that keeps failing is dead on its next failure
+SELECT o_id AS d2 FROM pay_webhook_record('razorpay', 'evt_old', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+ALTER TABLE pay_webhook_inbox DISABLE TRIGGER pay_webhook_inbox_guard;
+UPDATE pay_webhook_inbox SET received_at = now() - interval '30 days' WHERE id = :d2;
+ALTER TABLE pay_webhook_inbox ENABLE TRIGGER pay_webhook_inbox_guard;
+SELECT * FROM pay_webhook_claim(:d2);
+SELECT pg_temp.t_assert((SELECT o_status = 'dead' FROM pay_webhook_mark(:d2, 'unattributed', 'old')), 'a row older than webhook_dead_after_days is declared dead on its next open outcome');
+-- requeue
+SELECT pg_temp.t_expect(format('SELECT _pay_webhook_requeue(%s, '''', ''x'')', :d1), 'PY020', 'requeue needs an actor');
+SELECT _pay_webhook_requeue(:d1, 'ops', 'bug fixed');
+SELECT pg_temp.t_assert((SELECT status = 'failed' AND attempts = 0 AND last_error LIKE 'requeued by ops: bug fixed%' FROM pay_webhook_inbox WHERE id = :d1), 'an operator can requeue a dead row with a fresh budget, history kept in last_error');
+SELECT pg_temp.t_expect(format('SELECT _pay_webhook_requeue(%s, ''ops'', ''x'')', :e1), 'PY021', 'an applied row cannot be requeued');
+-- ordering: fewest attempts first
+SELECT o_id AS q_fresh FROM pay_webhook_record('razorpay', 'evt_q_fresh', 'payment.captured', 'plat', '{}', '{}', NULL) \gset
+SELECT * FROM pay_webhook_claim(:q_fresh);
+SELECT * FROM pay_webhook_mark(:q_fresh, 'failed', 'x');
+UPDATE pay_webhook_inbox SET locked_until = NULL WHERE id IN (:q_fresh, :d1);
+UPDATE pay_webhook_inbox SET attempts = 7 WHERE id = :d1;
+SELECT pg_temp.t_assert((SELECT o_attempts < (SELECT o_attempts FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :d1) FROM pay_webhook_replay_candidates(100, 0) WHERE o_id = :q_fresh),
+    'a row that keeps failing sorts behind fresher work (no starvation)');
+SELECT pg_temp.t_assert((SELECT o_id <> :d1 FROM pay_webhook_replay_candidates(1, 0)), 'with a small limit the heavily-retried row is not the one picked');
+
+\echo '======== review fixes: retention and redaction ========'
+SELECT o_id AS rd1 FROM pay_webhook_record('razorpay', 'evt_redact', 'payment.captured', 'plat',
+    '{"event":"payment.captured","payload":{"payment":{"entity":{"email":"payer@example.test","contact":"+910000000000"}}}}', '{}',
+    '{"type":"payment.captured","gateway_txn_ref":"pay_r1","amount_minor_units":58882,"currency":"INR","tenant_id":"t","platform_code":"plat","order_ref":"ord_r1"}') \gset
+SELECT * FROM pay_webhook_claim(:rd1);
+SELECT * FROM pay_webhook_mark(:rd1, 'applied');
+SELECT pg_temp.t_assert(_pay_webhook_redact_expired('tester') = 0, 'nothing is redacted inside the retention period');
+ALTER TABLE pay_webhook_inbox DISABLE TRIGGER pay_webhook_inbox_guard;
+UPDATE pay_webhook_inbox SET received_at = now() - interval '14 months' WHERE id = :rd1;
+UPDATE pay_webhook_inbox SET received_at = now() - interval '14 months' WHERE id = :f1;
+ALTER TABLE pay_webhook_inbox ENABLE TRIGGER pay_webhook_inbox_guard;
+SELECT pg_temp.t_expect('SELECT _pay_webhook_redact_expired('''')', 'PY020', 'redaction needs an actor');
+SELECT pg_temp.t_assert(_pay_webhook_redact_expired('tester') >= 1, 'a final row past 13 months is redacted');
+SELECT pg_temp.t_assert((SELECT redacted_at IS NOT NULL AND raw_body::jsonb->>'redacted' = 'true' AND raw_body NOT LIKE '%payer@example.test%' AND raw_body NOT LIKE '%+91%'
+                                AND raw_body::jsonb->>'body_sha256' = body_sha256 AND raw_body::jsonb->'event'->>'gateway_txn_ref' = 'pay_r1'
+                                AND raw_body::jsonb->'event'->>'order_ref' = 'ord_r1'
+                           FROM pay_webhook_inbox WHERE id = :rd1), 'the personal data is gone; the hash and the non-personal facts remain');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(redacted_by) = 'tester' AND max(retention_months) = 13 FROM pay_webhook_redactions WHERE inbox_id = :rd1), 'the redaction is audited (who, which period)');
+SELECT pg_temp.t_assert((SELECT redacted_at IS NULL FROM pay_webhook_inbox WHERE id = :u1) AND (SELECT count(*) = 0 FROM pay_webhook_redactions r JOIN pay_webhook_inbox i ON i.id = r.inbox_id WHERE i.status IN ('received','failed','unattributed')),
+    'open rows (received / failed / unattributed) are never redacted');
+SELECT pg_temp.t_expect(format($f$UPDATE pay_webhook_inbox SET raw_body = '{"redacted":true,"body_sha256":"x"}', redacted_at = now() WHERE id = %s$f$, :e1), 'PY022',
+    'the guard accepts ONLY a genuine redaction (the hash must match)');
+-- a perfectly shaped redaction (right hash) is still refused outside the audited path
+SELECT pg_temp.t_expect(format($f$UPDATE pay_webhook_inbox SET raw_body = jsonb_build_object('redacted', true, 'body_sha256', body_sha256)::text, redacted_at = now() WHERE id = %s$f$, :e1), 'PY022',
+    'a correctly shaped redaction without the audited-path flag is refused');
+SELECT set_config('pay.redacting', 'on', false);
+SELECT pg_temp.t_expect(format($f$UPDATE pay_webhook_inbox SET raw_body = jsonb_build_object('redacted', true, 'body_sha256', body_sha256)::text, redacted_at = now() WHERE id = %s$f$, :e1), 'PY022',
+    'even WITH the flag, a redaction with no audit row for that row is refused');
+SELECT set_config('pay.redacting', 'off', false);
+SELECT pg_temp.t_expect(format($f$UPDATE pay_webhook_inbox SET raw_body = 'tampered' WHERE id = %s$f$, :rd1), 'PY022', 'a redacted body cannot be rewritten');
+SELECT pg_temp.t_expect(format($f$UPDATE pay_webhook_inbox SET redacted_at = NULL WHERE id = %s$f$, :rd1), 'PY022', 'redaction cannot be undone');
+SELECT pg_temp.t_expect('UPDATE pay_webhook_redactions SET redacted_by = ''x''', 'PY022', 'the redaction audit is append-only');
+SELECT pg_temp.t_expect('TRUNCATE pay_webhook_inbox CASCADE', 'PY019', 'the inbox cannot be truncated');
+
+\echo 'ALL L7.2 SQL ASSERTIONS PASSED'

@@ -39,7 +39,7 @@ SELECT inv_issue_invoice(
     'INR', NULL, NULL,
     '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly subscription','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 
 \echo '--- A stored fields: taxable=49900 cgst=4491 sgst=4491 igst=0 gross=58882 tax_invoice/intrastate/issued -> ok=t ---'
@@ -72,7 +72,7 @@ SELECT inv_issue_invoice(
     inv_money_to_decimal_string(inv_fx_inr_statutory_value_from_decimal('USD','2026-09-13','50.00')),
     '2026-09-13',
     ARRAY[ROW('Website build — export service','998314','1','50.00',0,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-13', 'issued'
+    NULL, 'seed', '2026-09-13', 'issued', p_mode => 'live'
 ) AS invoice_id;
 
 \echo '--- B stored: gross=5000 taxable=5000 currency=USD amount_inr=478623 export_lut igst=0 -> ok=t ---'
@@ -95,7 +95,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    'paypal', 'seed', '2026-09-01', 'issued'
+    'paypal', 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 \echo '--- per-invoice override -> paypal / invoice_override (beats the IN country rule) -> ok=t ---'
 SELECT (gateway_code='paypal' AND resolved_by='invoice_override') AS ok_invoice_override
@@ -109,7 +109,7 @@ SELECT inv_issue_invoice(
     ROW('Override Co',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 \echo '--- tenant-level override -> paypal / customer_override (beats the IN country rule) -> ok=t ---'
 SELECT (gateway_code='paypal' AND resolved_by='customer_override') AS ok_customer_override
@@ -134,7 +134,7 @@ SELECT inv_issue_invoice(
     'domestic', NULL, false, false, 'INR', NULL, NULL,
     '2026-09-13',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-13', 'issued'
+    NULL, 'seed', '2026-09-13', 'issued', p_mode => 'live'
 ) AS invoice_id;
 UPDATE inv_gateway_routing_rules SET is_active=false WHERE match_country_code IS NULL OR match_country_code='IN';  -- disable every route
 DO $$ BEGIN
@@ -207,7 +207,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 \echo '--- payability of an issued (not due) invoice = not_payable_status -> ok=t ---'
 SELECT (is_payable=false AND reason='not_payable_status') AS ok_not_payable_status
@@ -232,7 +232,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 SELECT inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number='INV-000503'), (SELECT tenant_id FROM inv_invoices WHERE invoice_number='INV-000503'), (SELECT platform_code FROM inv_invoices WHERE invoice_number='INV-000503'),'due','cron','2026-10-01');
 

@@ -73,6 +73,9 @@ BEGIN
         RAISE EXCEPTION 'tenant_id and platform_code are required' USING ERRCODE = 'ER001';
     END IF;
 
+    IF to_regclass('pay_config') IS NOT NULL AND EXISTS (SELECT 1 FROM pay_config WHERE config_key = 'wallet_v2:' || p_platform_code AND config_value = '1') THEN
+        RAISE EXCEPTION 'platform % has migrated to wallet v2: the v1 wallet functions no longer mint or debit credit for it (wallet_drain / the capture path are the source).', p_platform_code USING ERRCODE = 'PY074';
+    END IF;
     IF p_credits <= 0 THEN
         RAISE EXCEPTION 'free grant must be a positive number of credits (got %)', p_credits USING ERRCODE = 'ER013';
     END IF;

@@ -1,0 +1,36 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Put a dead / failed / unattributed webhook inbox row back into the replay queue. Operator tool: run on the server with the
+ * platform's DIRECT database credentials (the bootstrap file), never through the gateway's /call.
+ *
+ *   pay-webhook-requeue --bootstrap=/path/to/operator.php --id=42 --actor=asha --reason="processor bug fixed in 1.4.2"
+ *
+ * --actor and --reason are required, written into the row's history and logged to stderr. The bootstrap file RETURNS a
+ * configured StoneScriptPay\Http\Operator\WebhookRequeuer. Afterwards bin/pay-replay-webhooks re-drives the row.
+ */
+
+use StoneScriptPay\Http\Operator\WebhookRequeuer;
+
+$o = getopt('', ['bootstrap:', 'id:', 'actor:', 'reason:']);
+foreach (['bootstrap', 'id', 'actor', 'reason'] as $k) {
+    if (!isset($o[$k]) || !is_string($o[$k]) || trim($o[$k]) === '') {
+        fwrite(STDERR, "usage: pay-webhook-requeue --bootstrap=FILE --id=N --actor=NAME --reason=TEXT (missing --{$k})\n");
+        exit(1);
+    }
+}
+if (!is_file($o['bootstrap']) || !ctype_digit($o['id'])) {
+    fwrite(STDERR, "bootstrap file not found or --id is not a number\n");
+    exit(1);
+}
+$job = require $o['bootstrap'];
+if (!$job instanceof WebhookRequeuer) {
+    fwrite(STDERR, 'the bootstrap file must return a ' . WebhookRequeuer::class . "\n");
+    exit(1);
+}
+fwrite(STDERR, sprintf("[pay-webhook-requeue] actor=%s id=%s\n", $o['actor'], $o['id']));
+echo 'inbox row ' . $o['id'] . ' is now ' . $job->requeue((int) $o['id'], $o['actor'], $o['reason']) . "\n";
+exit(0);

@@ -2,7 +2,7 @@
     "name": "progalaxyelabs/stonescriptphp-payments",
     "description": "The unified payment system for StoneScriptPHP — merges what were separately-published stonescriptphp-pay (Razorpay/PayPal transport drivers) and stonescriptphp-invoice (SQL-first billing/invoicing) into one package: gateway drivers, the idempotent payment-capture primitive, and SQL-first subscription/one-time/credit/wallet/consumption/passthrough pricing, invoices, parties, pluggable regional tax computation (ships India GST), gateway routing, and durable transactional-outbox intimation. All business logic lives in PostgreSQL functions deployed via the StoneScriptDB Gateway; PHP is transport only.",
     "type": "library",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "license": "MIT",
     "keywords": [
         "php",
@@ -41,10 +41,10 @@
     },
     "require-dev": {
         "phpunit/phpunit": "^11.0",
-        "progalaxyelabs/stonescriptphp": "^9.17.0"
+        "progalaxyelabs/stonescriptphp": "^12.0"
     },
     "suggest": {
-        "progalaxyelabs/stonescriptphp": "Required ONLY to use src/Php/InvoiceSourceAdapter.php — the sole PHP transport shim in this package's SQL-first invoicing side, implementing StoneScriptPHP\\Billing\\Contracts\\InvoiceSource. Pure-SQL usage (issue invoices, run collections/dunning queries, manual mark-paid) and the payment-driver side never need the framework."
+        "progalaxyelabs/stonescriptphp": "Required (>= 12.0) ONLY by the framework adapters: src/Php/InvoiceSourceAdapter.php (StoneScriptPHP\\Billing\\Contracts\\InvoiceSource), src/Http/Webhook/DatabaseFnCaller.php (Database::fn / Database::mutate), src/Http/Entitlement/EntitlementMiddleware.php and FrameworkMainDbScope.php, and src/Http/Routes/PostWebhookRoute.php. The SQL, the drivers and the pure-PHP classes (EntitlementGuard, EntitlementOperations, WalletOperations) never need the framework."
     },
     "autoload": {
         "psr-4": {
@@ -80,5 +80,14 @@
         ]
     },
     "minimum-stability": "stable",
-    "prefer-stable": true
+    "prefer-stable": true,
+    "bin": [
+        "bin/pay-replay-webhooks",
+        "bin/pay-purge-webhooks",
+        "bin/pay-refund-queue-alerts",
+        "bin/pay-refund-queue-resolve",
+        "bin/pay-webhook-requeue",
+        "bin/pay-entitlement",
+        "bin/pay-wallet"
+    ]
 }

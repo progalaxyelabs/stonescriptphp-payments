@@ -77,6 +77,9 @@ BEGIN
         RAISE EXCEPTION 'tenant_id and platform_code are required' USING ERRCODE = 'ER001';
     END IF;
 
+    IF to_regclass('pay_config') IS NOT NULL AND EXISTS (SELECT 1 FROM pay_config WHERE config_key = 'wallet_v2:' || p_platform_code AND config_value = '1') THEN
+        RAISE EXCEPTION 'platform % has migrated to wallet v2: the v1 wallet functions no longer mint or debit credit for it (wallet_drain / the capture path are the source).', p_platform_code USING ERRCODE = 'PY074';
+    END IF;
     SELECT wdr.id, wdr.credits_per_unit
     INTO v_rate
     FROM wallet_drain_rates wdr

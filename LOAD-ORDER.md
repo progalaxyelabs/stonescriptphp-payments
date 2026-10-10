@@ -124,6 +124,12 @@ Group order (each group's files are spread across the feature's
 033                      Tax       (country-agnostic: inv_tax_scheme + inv_resolve_tax_scheme — additive multi-country scaffolding, see the note on inv_tax_scheme; independent of 024-032/034/035, may load anywhere after money primitives exist)
 034, 035                 Invoicing (persisted invoices, payments, gateway routing, status lifecycle, CRM chase)
 037                      Outbox    (transactional-outbox product<->central intimation)
+050 (and up)             Core      (cross-feature objects: 050_50 = _pay_ensure_reference_data, GENERATED from the seeders; 050_51 = _pay_apply_schema_upgrades; 051 = webhook inbox: table 051_10, functions 051_50 .. 051_55; 052 = orders and the capture path: tables 052_10 .. 052_12, functions 052_40 .. 052_62: 052_45 = _pay_queue_refund, 052_46 = _pay_capture_raw_allowlist (both before pay_apply_capture at 052_53), 052_47/052_48 = refund-queue ageing, 052_49 = public pay_order_quote; 053 = entitlement: tables 053_10 .. 053_12, functions 053_40 .. 053_58, the view in 053_56; 054 = wallet v2 and the ledger: tables 054_10 .. 054_16, functions 054_40 .. 054_53)
+
+Issuer / series objects belong to Invoicing and sit inside its range because inv_invoices
+references them: tables 034_05 .. 034_08 (issuers, series, counter, adoptions) sort before
+034_15 (inv_invoices); functions 035_08 .. 035_21 (upsert, create, allocate, adopt, guards and
+their triggers; each trigger file sorts after its function file). 027_03 is the India FY label.
 ```
 
 Note `Capture`'s own prefix range (`001`) is a SEPARATE numbering track from

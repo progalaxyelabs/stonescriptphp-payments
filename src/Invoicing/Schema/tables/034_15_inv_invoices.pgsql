@@ -58,7 +58,7 @@
 
 CREATE TABLE inv_invoices (
     id                      BIGSERIAL PRIMARY KEY,
-    invoice_number          TEXT NOT NULL UNIQUE,   -- [MINIMAL] length/charset-valid (validated by 027 at issue)
+    invoice_number          TEXT UNIQUE,            -- [MINIMAL] length/charset-valid (validated by 027 at issue). NULL ONLY while a series-issued invoice is still a draft: the number is allocated at the draft->issued edge, so an abandoned draft never burns a serial.
 
     -- --- tenant identity ---
     -- Mirrors the auth service's own tenant_memberships shape 1:1
@@ -121,8 +121,27 @@ CREATE TABLE inv_invoices (
     voided_at               TIMESTAMPTZ,            -- [NOW-CANDIDATE] set on ->void
     cancelled_at            TIMESTAMPTZ,            -- [NOW-CANDIDATE] set on ->cancelled
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),   -- [NOW-CANDIDATE]
-    created_by              TEXT NOT NULL
+    created_by              TEXT NOT NULL,
+    -- ---- numbering + snapshots (L7.1). All nullable: rows issued before these existed keep NULLs. ----
+    -- A non-NULL value here never changes (inv_invoices_guard); NULL may be back-filled once.
+    issuer_id               BIGINT REFERENCES inv_issuers(id),
+    series_id               BIGINT REFERENCES inv_series(id),
+    fy_label                TEXT,                   -- '' for a series without fy_reset
+    number_seq              BIGINT,                 -- the serial within (series, fy_label)
+    mode                    TEXT CHECK (mode IN ('live', 'test')),
+    issue_date              DATE,                   -- the document date (IST), set when the number is allocated
+    seller_legal_name       TEXT,                   -- snapshot of the seller at issue
+    seller_gstin            TEXT,
+    seller_registration_status TEXT,
+    seller_state_code       TEXT,
+    seller_address          TEXT,
+    buyer_legal_name        TEXT,                   -- snapshot of the buyer at issue
+    buyer_gstin             TEXT,
+    buyer_registration_status TEXT,
+    buyer_state_code        TEXT
 );
 CREATE INDEX inv_invoices_customer   ON inv_invoices (tenant_id, platform_code);
 CREATE INDEX inv_invoices_status     ON inv_invoices (status);
 CREATE INDEX inv_invoices_platform   ON inv_invoices (platform_code);
+CREATE UNIQUE INDEX inv_invoices_series_serial ON inv_invoices (series_id, fy_label, number_seq) WHERE series_id IS NOT NULL AND number_seq IS NOT NULL;
+CREATE INDEX inv_invoices_issuer     ON inv_invoices (issuer_id) WHERE issuer_id IS NOT NULL;

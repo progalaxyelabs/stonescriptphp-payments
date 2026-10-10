@@ -37,6 +37,22 @@
 -- calling it, (3) INSERT its inv_tax_scheme row — never a dynamic/EXECUTEd
 -- function-name dispatch.
 
+-- NUMBERING (L7.1). Two mutually exclusive ways to number the document:
+--   * SERIES (the lawful way): pass p_series_code and p_mode, leave p_invoice_number NULL.
+--     The library allocates the next gapless serial of that series IN THIS TRANSACTION
+--     (_inv_series_allocate), takes the seller from the series' issuer (a p_seller you
+--     also pass must agree with it, PY015) and snapshots seller and buyer onto the row.
+--     p_mode ('live' | 'test') is mandatory and must equal the series' mode (PY012):
+--     a test document never draws a live number, nor a live one a test number. A LIVE
+--     series whose issuer is still a placeholder refuses (PY013). An invoice opened as
+--     'draft' takes NO number: it is allocated on the draft -> issued edge
+--     (inv_transition_invoice_status), so an abandoned draft never burns a serial.
+--   * EXPLICIT NUMBER (legacy / import): pass p_invoice_number and no series, exactly as
+--     before. The number is validated (length, charset) but is NOT allocated by the
+--     library, so it carries no gapless guarantee; use it only to import documents
+--     numbered elsewhere. series_id stays NULL on such rows.
+-- Passing both, or neither, is PY016.
+
 CREATE OR REPLACE FUNCTION inv_issue_invoice(
     p_invoice_number        TEXT,
     p_tenant_id             UUID,
@@ -62,7 +78,9 @@ CREATE OR REPLACE FUNCTION inv_issue_invoice(
     p_gateway_override_code TEXT,           -- NULL => resolve by rule at pay time
     p_created_by            TEXT,
     p_created_at            TIMESTAMPTZ DEFAULT now(),    -- [NOW-CANDIDATE] trailing+defaulted: prod omits, tests pass explicit
-    p_initial_status        TEXT DEFAULT 'issued'
+    p_initial_status        TEXT DEFAULT 'issued',
+    p_series_code           TEXT DEFAULT NULL,   -- NULL => explicit-number (legacy/import) path
+    p_mode                  TEXT DEFAULT NULL    -- 'live' | 'test'; required with a series
 ) RETURNS BIGINT AS $$
 DECLARE
     v_ci     inv_computed_invoice;
@@ -72,9 +90,70 @@ DECLARE
     v_issued TIMESTAMPTZ;
     v_scheme_type TEXT;
     v_tax_country_code TEXT;
+    v_series  inv_series;
+    v_issuer  inv_issuers;
+    v_alloc   RECORD;
+    v_seller  inv_party_input;
+    v_number  TEXT;
+    v_fy      TEXT;
+    v_seq     BIGINT;
+    v_mode    TEXT;
 BEGIN
+    PERFORM _inv_assert_schema_current();
     IF p_tenant_id IS NULL OR p_platform_code IS NULL OR p_platform_code = '' THEN
         RAISE EXCEPTION 'tenant_id and platform_code are required' USING ERRCODE = 'ER001';
+    END IF;
+
+    -- ---- numbering + seller resolution (L7.1) ----
+    IF p_series_code IS NOT NULL THEN
+        IF p_invoice_number IS NOT NULL THEN
+            RAISE EXCEPTION 'pass either a series (the library allocates the number) or an explicit invoice number, not both.'
+                USING ERRCODE = 'PY016';
+        END IF;
+        SELECT * INTO v_series FROM inv_series WHERE series_code = p_series_code;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'series "%" does not exist.', p_series_code USING ERRCODE = 'PY010';
+        END IF;
+        IF NOT v_series.is_active OR v_series.kind <> 'invoice' THEN
+            RAISE EXCEPTION 'series "%" is not an active invoice series.', p_series_code USING ERRCODE = 'PY011';
+        END IF;
+        IF p_mode IS NULL OR p_mode NOT IN ('live', 'test') THEN
+            RAISE EXCEPTION 'mode must be ''live'' or ''test'' when issuing from a series (got "%"); it is never assumed.', p_mode
+                USING ERRCODE = 'PY012';
+        END IF;
+        IF v_series.mode <> p_mode THEN
+            RAISE EXCEPTION 'series "%" is a % series but the document is in % mode: test and live numbers never mix.',
+                p_series_code, v_series.mode, p_mode USING ERRCODE = 'PY012';
+        END IF;
+        SELECT * INTO v_issuer FROM inv_issuers WHERE id = v_series.issuer_id;
+        v_seller := ROW(v_issuer.legal_name, v_issuer.gstin, 'seller', v_issuer.registration_status,
+                        NULL, v_issuer.state_code)::inv_party_input;
+        IF p_seller IS NOT NULL
+           AND ((p_seller).gstin IS DISTINCT FROM v_issuer.gstin
+                OR (p_seller).registration_status IS DISTINCT FROM v_issuer.registration_status) THEN
+            RAISE EXCEPTION 'the seller passed does not match the issuer "%" of series "%": the series decides who the seller is.',
+                v_issuer.issuer_code, p_series_code USING ERRCODE = 'PY015';
+        END IF;
+        v_mode := v_series.mode;
+    ELSE
+        IF p_invoice_number IS NULL THEN
+            RAISE EXCEPTION 'an invoice number is required when no series is given.' USING ERRCODE = 'PY016';
+        END IF;
+        IF p_mode IS NULL OR p_mode NOT IN ('live', 'test') THEN
+            RAISE EXCEPTION 'an explicit invoice number needs an explicit mode (''live'' or ''test''; got "%"): a TEST number can never land in a live row.', p_mode
+                USING ERRCODE = 'PY012';
+        END IF;
+        IF (p_mode = 'test') IS DISTINCT FROM (upper(left(p_invoice_number, 4)) = 'TEST') THEN
+            RAISE EXCEPTION 'invoice number "%" does not match mode %: test numbers start with TEST and live numbers never do.', p_invoice_number, p_mode
+                USING ERRCODE = 'PY012';
+        END IF;
+        IF EXISTS (SELECT 1 FROM inv_series s
+                    WHERE left(p_invoice_number, length(_inv_series_head(s.prefix, s.sep))) = _inv_series_head(s.prefix, s.sep)) THEN
+            RAISE EXCEPTION 'invoice number "%" falls inside a numbering series: numbers of a series are allocated by the library, never supplied.', p_invoice_number
+                USING ERRCODE = 'PY016';
+        END IF;
+        v_seller := p_seller;
+        v_mode := p_mode;
     END IF;
 
     IF p_billing_country_code IS NULL OR p_billing_country_code !~ '^[A-Za-z]{2}$' THEN
@@ -139,7 +218,7 @@ BEGIN
     -- GSTIN shape/registration-status further down for the actual GST math
     -- — this is an EARLIER, narrower check specifically gating the tax-
     -- scheme SHORTCUT, not a replacement for that validation.
-    IF p_supply_type <> 'domestic' AND (p_seller.gstin IS NULL OR btrim(p_seller.gstin) = '') THEN
+    IF p_supply_type <> 'domestic' AND (v_seller.gstin IS NULL OR btrim(v_seller.gstin) = '') THEN
         RAISE EXCEPTION 'an export invoice (supply_type "%") requires the seller to carry a GSTIN — this package only implements an India-seller export tax scheme (LUT/IGST) and refuses to assume it without that evidence.', p_supply_type
             USING ERRCODE = 'ER070';
     END IF;
@@ -151,11 +230,23 @@ BEGIN
     -- (never EXECUTE/dynamic dispatch by constructed name). Today only
     -- 'in_gst' has a wired engine; every other scheme_type value is a
     -- config/data error until this package ships that country's engine.
+    -- number the document as late as possible (the counter lock is held to the end of
+    -- this transaction): a series invoice opened as 'draft' has no number yet.
+    IF p_series_code IS NOT NULL AND p_initial_status = 'issued' THEN
+        PERFORM set_config('pay.issuing', 'on', true);
+        SELECT * INTO v_alloc FROM _inv_series_allocate(p_series_code, p_issue_date, p_mode);
+        v_number := v_alloc.o_invoice_number;
+        v_fy := v_alloc.o_fy_label;
+        v_seq := v_alloc.o_number_seq;
+    ELSIF p_series_code IS NULL THEN
+        v_number := p_invoice_number;
+    END IF;
+
     CASE v_scheme_type
         WHEN 'in_gst' THEN
             v_ci := inv_compute_invoice(
-                p_seller, p_buyer, p_supply_type, p_document_type, p_price_is_inclusive, p_round_off,
-                p_currency, p_fx_rate, p_amount_inr, p_invoice_number, p_issue_date, p_lines);
+                v_seller, p_buyer, p_supply_type, p_document_type, p_price_is_inclusive, p_round_off,
+                p_currency, p_fx_rate, p_amount_inr, v_number, p_issue_date, p_lines);
         ELSE
             RAISE EXCEPTION 'tax scheme "%" (resolved for billing country "%") has no wired compute engine in this package — only ''in_gst'' is implemented today.',
                 v_scheme_type, upper(v_tax_country_code) USING ERRCODE = 'ER068';
@@ -172,18 +263,26 @@ BEGIN
         currency, fx_rate, amount_inr_minor,
         billing_country_code, billing_state_snapshot,
         gateway_override_code,
-        status, due_date, issued_at, created_at, created_by)
+        status, due_date, issued_at, created_at, created_by,
+        issuer_id, series_id, fy_label, number_seq, mode, issue_date,
+        seller_legal_name, seller_gstin, seller_registration_status, seller_state_code, seller_address,
+        buyer_legal_name, buyer_gstin, buyer_registration_status, buyer_state_code)
     VALUES (
-        v_ci.invoice_number, p_tenant_id, p_platform_code, p_charge_source, p_charge_ref,
+        v_number, p_tenant_id, p_platform_code, p_charge_source, p_charge_ref,
         p_period_start, p_period_end,
         v_ci.document_type, v_ci.tax_treatment, v_ci.place_of_supply_code, (v_ci.lines[1]).hsn_sac,
         v_ci.taxable_value_minor, v_ci.cgst_minor, v_ci.sgst_minor, v_ci.igst_minor, v_ci.round_off_minor, v_ci.gross_total_minor,
         v_ci.currency, v_ci.fx_rate, v_ci.amount_inr_minor,
         upper(p_billing_country_code), p_billing_state,
         p_gateway_override_code,
-        p_initial_status, p_due_date, v_issued, p_created_at, p_created_by)
+        p_initial_status, p_due_date, v_issued, p_created_at, p_created_by,
+        v_issuer.id, v_series.id, v_fy, v_seq, v_mode,
+        CASE WHEN v_number IS NOT NULL THEN (p_issue_date AT TIME ZONE 'Asia/Kolkata')::DATE END,
+        v_seller.legal_name, v_seller.gstin, v_seller.registration_status, v_ci.seller_state_code, v_issuer.address,
+        p_buyer.legal_name, p_buyer.gstin, v_ci.buyer_effective_registration_status, v_ci.buyer_state_code)
     RETURNING id INTO v_id;
 
+    PERFORM set_config('pay.issuing', 'on', true);   -- lets the lines guard accept lines of the header just written
     FOREACH v_cl IN ARRAY v_ci.lines LOOP
         v_no := v_no + 1;
         INSERT INTO inv_invoice_lines (
@@ -194,6 +293,7 @@ BEGIN
             v_cl.taxable_value_minor, v_cl.cgst_minor, v_cl.sgst_minor, v_cl.igst_minor, v_cl.line_total_minor);
     END LOOP;
 
+    PERFORM set_config('pay.issuing', 'off', true);
     RETURN v_id;
 END;
 $$ LANGUAGE plpgsql;

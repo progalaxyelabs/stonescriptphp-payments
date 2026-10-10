@@ -1,0 +1,111 @@
+-- stonescriptphp-payments :: TEST - capture-first invoice totals against an independent
+-- reference (L7.3). STRICT (sets ON_ERROR_STOP itself).
+--
+-- 20 synthetic captures covering intrastate and interstate supply, tax-exclusive and
+-- tax-inclusive prices, decimal quantities, line discounts, several lines and rates (5/12/18/28%),
+-- odd GST halves and nearest-rupee round-off. For each: an order is created at the expected gross,
+-- the capture is applied through pay_apply_capture, and the invoice that results must carry the
+-- expected taxable value, CGST, SGST, IGST, round-off and gross to the paisa. The expected figures
+-- were produced by an independent integer re-implementation of the documented GST formulas (half-up
+-- at one defined point per line, CGST = half of the line's rounded total tax (half-up) and SGST = the remainder, inclusive prices back-computed), not by
+-- the SQL under test. Each order is also created at gross+1 and must be refused (PY034): the quoted
+-- amount is proved against the invoice before any money is taken.
+--
+-- NOT a differential against any platform's historical captures: that needs anonymised legacy
+-- data, which this library's tests deliberately never carry.
+\set ON_ERROR_STOP on
+UPDATE inv_gst_config SET config_value = '36500' WHERE config_key IN ('issue_date_window_days_live', 'issue_date_window_days_test');
+UPDATE pay_config SET config_value = '4000000000' WHERE config_key = 'pay_clock_skew_seconds';
+UPDATE pay_config SET config_value = '100000000' WHERE config_key = 'ent_late_apply_grace_hours';
+
+CREATE FUNCTION pg_temp.t_assert(p_ok BOOLEAN, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    IF p_ok IS NOT TRUE THEN RAISE EXCEPTION 'ASSERTION FAILED: %', p_label; END IF;
+    RAISE NOTICE 'ok: %', p_label;
+END; $$ LANGUAGE plpgsql;
+
+SELECT _inv_issuer_upsert('vec-issuer', 'l73vec', NULL, 'Vector Seller Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester');
+SELECT _inv_series_create('vec-inv', 'vec-issuer', 'invoice', 'live', 'VC', '/', 6, true, 'tester');
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES (9101, 'Vector licence', false, true, false, '2026-01-01', 'seed');
+INSERT INTO one_time_pricing_plans (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, credit_quantity, amount, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES (9101, 9101, NULL, NULL, true, false, NULL, 100, true, true, '2026-01-01', 'seed');
+
+CREATE FUNCTION pg_temp.t_vector(p_idx INT, p_name TEXT, p_state TEXT, p_inclusive BOOLEAN, p_roundoff BOOLEAN, p_lines JSONB,
+                                 p_taxable BIGINT, p_cgst BIGINT, p_sgst BIGINT, p_igst BIGINT, p_round_off BIGINT, p_gross BIGINT)
+RETURNS VOID AS $$
+DECLARE
+    v_tenant UUID := ('00000000-0000-0000-0000-00000000c0' || lpad(p_idx::text, 2, '0'))::uuid;
+    v_spec   JSONB;
+    v_ref    TEXT;
+    v_inv    inv_invoices;
+    v_out    RECORD;
+BEGIN
+    v_spec := jsonb_build_object(
+        'buyer', jsonb_build_object('legal_name', 'Vector Buyer', 'registration_status', 'unregistered', 'address_state', p_state),
+        'billing_country_code', 'IN', 'billing_state', p_state, 'supply_type', 'domestic',
+        'price_is_inclusive', p_inclusive, 'round_off', p_roundoff, 'due_days', 0, 'lines', p_lines);
+
+    -- the public quote returns exactly the figures the invoice will carry, and its total is what pay_order_create enforces
+    SELECT * INTO v_out FROM pay_order_quote(v_tenant, 'l73vec', 'vec-inv', v_spec::text, 'INR');
+    IF (v_out.o_taxable_minor, v_out.o_cgst_minor, v_out.o_sgst_minor, coalesce(v_out.o_igst_minor, 0), coalesce(v_out.o_round_off_minor, 0), v_out.o_gross_minor)
+       IS DISTINCT FROM (p_taxable, coalesce(p_cgst, 0), coalesce(p_sgst, 0), coalesce(p_igst, 0), coalesce(p_round_off, 0), p_gross) THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - quote (% % % % % %) differs from the expected breakdown', p_name,
+            v_out.o_taxable_minor, v_out.o_cgst_minor, v_out.o_sgst_minor, v_out.o_igst_minor, v_out.o_round_off_minor, v_out.o_gross_minor;
+    END IF;
+    IF jsonb_array_length(v_out.o_lines) <> jsonb_array_length(p_lines) OR NOT v_out.o_orderable THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - quote lines or orderable flag wrong', p_name;
+    END IF;
+
+    BEGIN
+        PERFORM pay_order_create(v_tenant, 'l73vec', 'vec-' || p_idx || '-bad', 'one_time_license', '9101', NULL,
+            p_gross + 1, 'INR', 'razorpay', 'live', 'vec-inv', v_spec::text, 'tester');
+        RAISE EXCEPTION 'ASSERTION FAILED: % - an order at gross+1 was accepted', p_name;
+    EXCEPTION WHEN SQLSTATE 'PY034' THEN
+        NULL;   -- refused, as required
+    END;
+
+    SELECT o_order_ref INTO v_ref FROM pay_order_create(v_tenant, 'l73vec', 'vec-' || p_idx, 'one_time_license', '9101', NULL,
+        p_gross, 'INR', 'razorpay', 'live', 'vec-inv', v_spec::text, 'tester');
+    SELECT * INTO v_out FROM pay_apply_capture('razorpay', 'pay_vec_' || p_idx, v_ref, v_tenant, 'l73vec', p_gross, 'INR', 'live',
+        '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30');
+    IF v_out.o_outcome <> 'applied' THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - outcome was %', p_name, v_out.o_outcome;
+    END IF;
+    SELECT * INTO v_inv FROM inv_invoices WHERE id = v_out.o_invoice_id;
+    IF v_inv.taxable_value_minor IS DISTINCT FROM p_taxable OR coalesce(v_inv.cgst_minor, 0) IS DISTINCT FROM p_cgst
+       OR coalesce(v_inv.sgst_minor, 0) IS DISTINCT FROM p_sgst OR coalesce(v_inv.igst_minor, 0) IS DISTINCT FROM p_igst
+       OR v_inv.round_off_minor IS DISTINCT FROM p_round_off OR v_inv.gross_total_minor IS DISTINCT FROM p_gross
+       OR v_inv.status <> 'paid' THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - got taxable %, cgst %, sgst %, igst %, round_off %, gross % (%), expected %, %, %, %, %, %',
+            p_name, v_inv.taxable_value_minor, v_inv.cgst_minor, v_inv.sgst_minor, v_inv.igst_minor, v_inv.round_off_minor,
+            v_inv.gross_total_minor, v_inv.status, p_taxable, p_cgst, p_sgst, p_igst, p_round_off, p_gross;
+    END IF;
+    RAISE NOTICE 'ok: % -> % / % / % / % / % / %', p_name, p_taxable, p_cgst, p_sgst, p_igst, p_round_off, p_gross;
+END; $$ LANGUAGE plpgsql;
+
+SELECT pg_temp.t_vector(1, 'A01 1 x 499.00 @18 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18}]'::jsonb, 49900, 4491, 4491, 0, NULL, 58882);
+SELECT pg_temp.t_vector(2, 'A02 1 x 499.00 @18 excl inter', 'Maharashtra', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18}]'::jsonb, 49900, 0, 0, 8982, NULL, 58882);
+SELECT pg_temp.t_vector(3, 'A03 1 x 499.00 @18 incl intra', 'Karnataka', true, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18}]'::jsonb, 42288, 3806, 3806, 0, NULL, 49900);
+SELECT pg_temp.t_vector(4, 'A04 1 x 499.00 @18 incl inter', 'Maharashtra', true, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18}]'::jsonb, 42288, 0, 0, 7612, NULL, 49900);
+SELECT pg_temp.t_vector(5, 'A05 3 x 99.99 @18 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "3", "unit_price": "99.99", "gst_rate": 0.18}]'::jsonb, 29997, 2700, 2699, 0, NULL, 35396);
+SELECT pg_temp.t_vector(6, 'A06 2.5 x 120.50 @12 excl inter', 'Maharashtra', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "2.5", "unit_price": "120.50", "gst_rate": 0.12}]'::jsonb, 30125, 0, 0, 3615, NULL, 33740);
+SELECT pg_temp.t_vector(7, 'A07 1 x 1999.00 @18 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "1999.00", "gst_rate": 0.18}]'::jsonb, 199900, 17991, 17991, 0, NULL, 235882);
+SELECT pg_temp.t_vector(8, 'A08 7 x 33.33 @5 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "7", "unit_price": "33.33", "gst_rate": 0.05}]'::jsonb, 23331, 584, 583, 0, NULL, 24498);
+SELECT pg_temp.t_vector(9, 'A09 1 x 1000.01 @28 excl inter', 'Maharashtra', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "1000.01", "gst_rate": 0.28}]'::jsonb, 100001, 0, 0, 28000, NULL, 128001);
+SELECT pg_temp.t_vector(10, 'A10 1 x 1000.01 @28 incl intra (odd GST halves)', 'Karnataka', true, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "1000.01", "gst_rate": 0.28}]'::jsonb, 78126, 10938, 10937, 0, NULL, 100001);
+SELECT pg_temp.t_vector(11, 'A11 1 x 0.99 @18 excl intra (tiny)', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "0.99", "gst_rate": 0.18}]'::jsonb, 99, 9, 9, 0, NULL, 117);
+SELECT pg_temp.t_vector(12, 'A12 1 x 49.00 @18 incl intra', 'Karnataka', true, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "49.00", "gst_rate": 0.18}]'::jsonb, 4153, 374, 373, 0, NULL, 4900);
+SELECT pg_temp.t_vector(13, 'A13 10 x 49.00 @18 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "10", "unit_price": "49.00", "gst_rate": 0.18}]'::jsonb, 49000, 4410, 4410, 0, NULL, 57820);
+SELECT pg_temp.t_vector(14, 'A14 two lines 499.00@18 + 99.00@12 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18}, {"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "99.00", "gst_rate": 0.12}]'::jsonb, 59800, 5085, 5085, 0, NULL, 69970);
+SELECT pg_temp.t_vector(15, 'A15 two lines excl inter', 'Maharashtra', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "2", "unit_price": "250.25", "gst_rate": 0.18}, {"description": "Item", "hsn_sac": "998314", "quantity": "3", "unit_price": "10.10", "gst_rate": 0.05}]'::jsonb, 53080, 0, 0, 9161, NULL, 62241);
+SELECT pg_temp.t_vector(16, 'A16 discount 50.00 off 499.00 @18 excl intra', 'Karnataka', false, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18, "line_discount": "50.00"}]'::jsonb, 44900, 4041, 4041, 0, NULL, 52982);
+SELECT pg_temp.t_vector(17, 'A17 discount incl inter', 'Maharashtra', true, false, '[{"description": "Item", "hsn_sac": "998314", "quantity": "4", "unit_price": "250.00", "gst_rate": 0.18, "line_discount": "100.00"}]'::jsonb, 76271, 0, 0, 13729, NULL, 90000);
+SELECT pg_temp.t_vector(18, 'A18 round-off excl intra 1 x 499.00', 'Karnataka', false, true, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "499.00", "gst_rate": 0.18}]'::jsonb, 49900, 4491, 4491, 0, 18, 58900);
+SELECT pg_temp.t_vector(19, 'A19 round-off excl inter 3 x 99.99', 'Maharashtra', false, true, '[{"description": "Item", "hsn_sac": "998314", "quantity": "3", "unit_price": "99.99", "gst_rate": 0.18}]'::jsonb, 29997, 0, 0, 5399, 4, 35400);
+SELECT pg_temp.t_vector(20, 'A20 round-off incl intra three lines', 'Karnataka', true, true, '[{"description": "Item", "hsn_sac": "998314", "quantity": "1", "unit_price": "333.33", "gst_rate": 0.18}, {"description": "Item", "hsn_sac": "998314", "quantity": "2", "unit_price": "12.34", "gst_rate": 0.12}, {"description": "Item", "hsn_sac": "998314", "quantity": "5", "unit_price": "7.77", "gst_rate": 0.05}]'::jsonb, 34152, 2768, 2766, 0, 14, 39700);
+
+SELECT pg_temp.t_assert((SELECT count(*) = 20 FROM inv_invoices WHERE platform_code = 'l73vec' AND status = 'paid'), 'twenty paid invoices were produced');
+SELECT pg_temp.t_assert((SELECT array_agg(number_seq ORDER BY number_seq) = (SELECT array_agg(g::bigint) FROM generate_series(1, 20) g)
+                           FROM inv_invoices WHERE platform_code = 'l73vec'), 'and their numbers are exactly 1..20 (the refused gross+1 orders burned none)');
+
+\echo 'ALL L7.3 INVOICE-TOTAL VECTORS PASSED'

@@ -58,15 +58,35 @@ else
 fi
 
 rc_all=0
+failed_tests=""
 while IFS= read -r f; do
   case "$f" in */src/*) oes=1 ;; *) oes=0 ;; esac
   echo ">> $(basename "$f")  (ON_ERROR_STOP=$oes)"
-  $PSQL -v ON_ERROR_STOP=$oes -d "$DB" -q -f "$f" || { [ "$oes" = 1 ] && { echo "!! schema load aborted"; rc_all=1; break; }; }
+  if ! $PSQL -v ON_ERROR_STOP=$oes -d "$DB" -q -f "$f"; then
+    if [ "$oes" = 1 ]; then echo "!! schema load aborted"; rc_all=1; break; fi
+    # A test file that sets ON_ERROR_STOP itself (the strict, assertion-style
+    # tests) exits non-zero on its first failed assertion. The older demo and
+    # ER* negative-case files never do, so a non-zero exit is always a failure.
+    failed_tests="$failed_tests $(basename "$f")"
+  fi
 done <<< "$files"
 
 if [ "$SCHEMA_ONLY" = 0 ] && [ "$rc_all" = 0 ]; then
   echo "=== DIFFERENTIAL GOLDEN TALLY (expect failed = 0) ==="
   $PSQL -d "$DB" -c "SELECT count(*) total, count(*) FILTER (WHERE passed) passed, count(*) FILTER (WHERE NOT passed) failed FROM _inv_diff_results;"
   $PSQL -d "$DB" -tAc "SELECT label,actual,expected FROM _inv_diff_results WHERE NOT passed;"
+fi
+if [ -n "$failed_tests" ]; then
+  echo "!! FAILED strict SQL test files:$failed_tests"
+  rc_all=1
+fi
+
+# Multi-database / multi-process tests (they create and drop their own
+# throwaway paytest_* databases on the same server). Skip with SKIP_SHELL_TESTS=1.
+if [ "$SCHEMA_ONLY" = 0 ] && [ "$rc_all" = 0 ] && [ "${SKIP_SHELL_TESTS:-0}" != 1 ]; then
+  for t in "$ROOT"/tests/shell/l7_*.sh; do
+    echo ">> $(basename "$t")"
+    PSQL="$PSQL" bash "$t" || rc_all=1
+  done
 fi
 exit $rc_all

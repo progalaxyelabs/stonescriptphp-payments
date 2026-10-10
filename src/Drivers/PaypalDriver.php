@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace StoneScriptPay\Drivers;
 
 use StoneScriptPay\Contracts\PaymentProvider;
+use StoneScriptPay\Contracts\ServerSideCapture;
 use StoneScriptPay\DTO\CreateOrderRequest;
 use StoneScriptPay\DTO\CreateSubscriptionRequest;
 use StoneScriptPay\DTO\OrderResult;
+use StoneScriptPay\DTO\PaymentDetails;
 use StoneScriptPay\DTO\RefundRequest;
 use StoneScriptPay\DTO\RefundResult;
 use StoneScriptPay\DTO\SubscriptionResult;
@@ -15,6 +17,7 @@ use StoneScriptPay\DTO\VerificationResult;
 use StoneScriptPay\DTO\VerifyRequest;
 use StoneScriptPay\DTO\WebhookEvent;
 use StoneScriptPay\DTO\WebhookRequest;
+use StoneScriptPay\Exceptions\MalformedWebhookException;
 use StoneScriptPay\Exceptions\PaymentException;
 use StoneScriptPay\Exceptions\SignatureVerificationException;
 use StoneScriptPay\Exceptions\WebhookException;
@@ -69,17 +72,160 @@ use StoneScriptPay\Exceptions\WebhookException;
  *
  * @package StoneScriptPay\Drivers
  */
-final class PaypalDriver implements PaymentProvider
+final class PaypalDriver implements PaymentProvider, ServerSideCapture
 {
     private readonly string $baseUrl;
 
+    private ?string $cachedToken = null;
+    private int $cachedTokenExpiresAt = 0;
+
+    /**
+     * @param ?\Closure $transport Optional HTTP transport replacing curl:
+     *   fn(string $method, string $url, string $body, array $headers, ?string $basicAuth): array{0:int,1:string}
+     *   returning [httpStatus, body]. Exists for tests and custom transports.
+     * @param ?\Closure $clock Optional fn(): int returning the current unix time (token-cache expiry; tests).
+     */
     public function __construct(
         string $baseUrl,
         private readonly string $clientId,
         private readonly string $clientSecret,
         private readonly string $webhookId,
+        private readonly ?\Closure $transport = null,
+        private readonly ?\Closure $clock = null,
     ) {
         $this->baseUrl = rtrim($baseUrl, '/');
+    }
+
+    private function now(): int
+    {
+        return $this->clock !== null ? (int) ($this->clock)() : time();
+    }
+
+    // -------------------------------------------------------------------------
+    // Mode, publishable key, payment lookup
+    // -------------------------------------------------------------------------
+
+    /**
+     * @inheritdoc
+     *
+     * PayPal's sandbox and production live on different hosts: api-m.sandbox.paypal.com is test,
+     * api-m.paypal.com / api.paypal.com is live. Any other host (a proxy, a mock) is refused: the
+     * mode is never guessed.
+     */
+    public function mode(): string
+    {
+        $host = strtolower((string) parse_url($this->baseUrl, PHP_URL_HOST));
+        if (in_array($host, ['api-m.sandbox.paypal.com', 'api.sandbox.paypal.com'], true)) {
+            return 'test';
+        }
+        if (in_array($host, ['api-m.paypal.com', 'api.paypal.com'], true)) {
+            return 'live';
+        }
+        throw new PaymentException("PayPal mode cannot be determined from base URL host '{$host}'");
+    }
+
+    /** @inheritdoc */
+    public function publishableKeyId(): string
+    {
+        return $this->clientId;
+    }
+
+    /** A stable PayPal-Request-Id (max 108 chars) derived from a seed such as the order reference. */
+    private static function requestId(string $seed): string
+    {
+        return substr(hash('sha256', $seed), 0, 40);
+    }
+
+    /** @inheritdoc  PayPal cannot look an order up by our receipt; creation is idempotent through PayPal-Request-Id instead. */
+    public function findOrderByReceipt(string $receipt): ?OrderResult
+    {
+        return null;
+    }
+
+    /**
+     * @inheritdoc
+     *
+     * POST /v2/checkout/orders/{id}/capture with PayPal-Request-Id: the server-side capture after the buyer approved the
+     * order. Idempotent for the same request id (a retry returns the original capture; no second charge). The result is
+     * the capture, normalised.
+     */
+    public function captureApprovedOrder(string $gatewayOrderId, string $requestId): PaymentDetails
+    {
+        if (preg_match('/^[A-Za-z0-9_-]{5,64}$/D', $gatewayOrderId) !== 1) {
+            throw new PaymentException('PayPal capture: not a PayPal order id');
+        }
+        $token = $this->getAccessToken();
+        [$code, $body] = $this->request(
+            'POST',
+            '/v2/checkout/orders/' . rawurlencode($gatewayOrderId) . '/capture',
+            '{}',
+            ['Content-Type: application/json', "Authorization: Bearer $token", 'PayPal-Request-Id: ' . self::requestId('capture:' . $requestId)],
+        );
+        $json = json_decode($body, true);
+        $cap = is_array($json) ? ($json['purchase_units'][0]['payments']['captures'][0] ?? null) : null;
+        if ($code < 200 || $code >= 300 || !is_array($cap) || !isset($cap['id'], $cap['amount']['value'], $cap['amount']['currency_code'])) {
+            throw new PaymentException("PayPal capture failed (HTTP $code)");
+        }
+
+        return $this->normaliseCapture($cap + ['supplementary_data' => ['related_ids' => ['order_id' => $gatewayOrderId]]]);
+    }
+
+    /**
+     * @inheritdoc
+     *
+     * GET /v2/payments/captures/{id}. PayPal capture status COMPLETED is the settled state;
+     * PENDING / DECLINED / REFUNDED map to the canonical statuses below. The value is a decimal
+     * string in a 2-decimal currency (same assumption as createOrder()).
+     */
+    public function fetchPayment(string $paymentId): PaymentDetails
+    {
+        if ($paymentId === '') {
+            throw new PaymentException('PayPal fetchPayment: a capture id is required');
+        }
+        $token = $this->getAccessToken();
+        [$code, $body] = $this->request(
+            'GET',
+            '/v2/payments/captures/' . rawurlencode($paymentId),
+            '',
+            ["Authorization: Bearer $token", 'Content-Type: application/json'],
+        );
+        $json = json_decode($body, true);
+        if ($code < 200 || $code >= 300 || !is_array($json) || !isset($json['id'], $json['amount']['value'], $json['amount']['currency_code'])) {
+            throw new PaymentException("PayPal capture lookup failed (HTTP $code)");
+        }
+
+        return $this->normaliseCapture($json);
+    }
+
+    /** @param array<string,mixed> $json a PayPal capture resource */
+    private function normaliseCapture(array $json): PaymentDetails
+    {
+        $status = match (strtoupper((string) ($json['status'] ?? ''))) {
+            'COMPLETED' => 'captured',
+            'PENDING' => 'authorized',
+            'DECLINED', 'FAILED' => 'failed',
+            'REFUNDED', 'PARTIALLY_REFUNDED' => 'refunded',
+            default => 'unknown',
+        };
+        $time = $json['create_time'] ?? $json['update_time'] ?? null;     // the capture's own creation time IS the capture time
+        $capturedAt = null;
+        if (is_string($time) && $time !== '') {
+            $parsed = \DateTimeImmutable::createFromFormat(\DateTimeInterface::ATOM, $time)
+                ?: \DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.u\Z', $time);
+            $capturedAt = $parsed !== false ? $parsed : null;
+        }
+
+        return new PaymentDetails(
+            paymentId: (string) $json['id'],
+            status: $status,
+            amountMinorUnits: (int) round(((float) $json['amount']['value']) * 100),
+            currency: (string) $json['amount']['currency_code'],
+            gatewayOrderId: isset($json['supplementary_data']['related_ids']['order_id'])
+                ? (string) $json['supplementary_data']['related_ids']['order_id'] : null,
+            capturedAt: $capturedAt,
+            notes: isset($json['custom_id']) ? ['custom_id' => (string) $json['custom_id']] : [],
+            raw: $json,
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -167,7 +313,9 @@ final class PaypalDriver implements PaymentProvider
             'POST',
             '/v2/checkout/orders',
             (string) json_encode($payload, JSON_THROW_ON_ERROR),
-            ['Content-Type: application/json', "Authorization: Bearer $token"],
+            // PayPal-Request-Id makes the create idempotent: the same receipt (our order_ref) always yields the same PayPal
+            // order, so a retry or a race cannot create a second one.
+            ['Content-Type: application/json', "Authorization: Bearer $token", 'PayPal-Request-Id: ' . self::requestId('create:' . $req->receipt)],
         );
 
         $json = json_decode($body, true);
@@ -343,30 +491,38 @@ final class PaypalDriver implements PaymentProvider
             throw new WebhookException('webhook body is not valid JSON');
         }
 
-        if (!$this->verifyWebhookSignature($req->headers, $req->rawBody, $event)) {
+        if (!$this->verifyWebhookSignature($req->headers, $req->rawBody)) {
             throw new SignatureVerificationException('webhook');
         }
 
-        $providerEvent = (string) ($event['event_type'] ?? '');
-        $type = $providerEvent === 'PAYMENT.CAPTURE.COMPLETED' ? 'payment.captured' : 'unknown';
-        $resource = is_array($event['resource'] ?? null) ? $event['resource'] : [];
+        // The signature has verified: a failure from here on is an authentic event with a bad envelope,
+        // to be stored raw rather than dropped.
+        try {
+            $providerEvent = (string) ($event['event_type'] ?? '');
+            $type = $providerEvent === 'PAYMENT.CAPTURE.COMPLETED' ? 'payment.captured' : 'unknown';
+            $resource = is_array($event['resource'] ?? null) ? $event['resource'] : [];
 
-        [$invoiceRef, $gatewayTxnRef, $amountMinorUnits, $currency, $capturedAt, $tenantId, $platformCode] =
-            $this->extractNormalisedFields($type, $resource);
+            [$invoiceRef, $gatewayTxnRef, $amountMinorUnits, $currency, $capturedAt, $tenantId, $platformCode] =
+                $this->extractNormalisedFields($type, $resource);
 
-        return new WebhookEvent(
-            type: $type,
-            providerEvent: $providerEvent,
-            payload: $resource,
-            raw: $event,
-            invoiceRef: $invoiceRef,
-            gatewayTxnRef: $gatewayTxnRef,
-            amountMinorUnits: $amountMinorUnits,
-            currency: $currency,
-            capturedAt: $capturedAt,
-            tenantId: $tenantId,
-            platformCode: $platformCode,
-        );
+            return new WebhookEvent(
+                type: $type,
+                providerEvent: $providerEvent,
+                payload: $resource,
+                raw: $event,
+                invoiceRef: $invoiceRef,
+                gatewayTxnRef: $gatewayTxnRef,
+                amountMinorUnits: $amountMinorUnits,
+                currency: $currency,
+                capturedAt: $capturedAt,
+                tenantId: $tenantId,
+                platformCode: $platformCode,
+                eventId: isset($event['id']) && is_string($event['id']) && $event['id'] !== '' ? $event['id'] : null,
+                orderRef: $invoiceRef,   // library orders put their order_ref in the receipt part of custom_id
+            );
+        } catch (\Throwable $e) {
+            throw new MalformedWebhookException('webhook body could not be read: ' . $e::class, isset($event['id']) && is_string($event['id']) && $event['id'] !== '' ? $event['id'] : null);
+        }
     }
 
     /**
@@ -435,41 +591,47 @@ final class PaypalDriver implements PaymentProvider
      * @param array<string,string> $headers Raw request headers, any casing.
      * @param array<mixed> $event Decoded webhook body.
      */
-    private function verifyWebhookSignature(array $headers, string $rawBody, array $event): bool
+    private function verifyWebhookSignature(array $headers, string $rawBody): bool
     {
         $h = [];
         foreach ($headers as $k => $v) {
             $h[strtolower((string) $k)] = (string) $v;
         }
+        $j = static fn(string $v): string => json_encode($v, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
 
-        try {
-            $token = $this->getAccessToken();
-        } catch (\Throwable $e) {
-            return false;
+        // PayPal verifies the signature over the EXACT bytes it sent. The original body is therefore SPLICED into the
+        // verification request verbatim: decoding and re-encoding it would change number formats, escapes and key
+        // order and make a genuine event fail (or, worse, verify something other than what we then process).
+        $verifyPayload = '{"transmission_id":' . $j($h['paypal-transmission-id'] ?? '')
+            . ',"transmission_time":' . $j($h['paypal-transmission-time'] ?? '')
+            . ',"cert_url":' . $j($h['paypal-cert-url'] ?? '')
+            . ',"auth_algo":' . $j($h['paypal-auth-algo'] ?? '')
+            . ',"transmission_sig":' . $j($h['paypal-transmission-sig'] ?? '')
+            . ',"webhook_id":' . $j($this->webhookId)
+            . ',"webhook_event":' . $rawBody . '}';
+
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            try {
+                $token = $this->getAccessToken();
+            } catch (\Throwable $e) {
+                return false;
+            }
+            [$code, $body] = $this->request(
+                'POST',
+                '/v1/notifications/verify-webhook-signature',
+                $verifyPayload,
+                ['Content-Type: application/json', "Authorization: Bearer $token"],
+            );
+            if ($code === 401 && $attempt === 0) {
+                $this->forgetToken();     // the cached token was revoked or expired early: get a fresh one once
+                continue;
+            }
+            $json = json_decode($body, true);
+
+            return $code >= 200 && $code < 300 && is_array($json) && ($json['verification_status'] ?? '') === 'SUCCESS';
         }
 
-        $verifyPayload = json_encode([
-            'transmission_id' => $h['paypal-transmission-id'] ?? '',
-            'transmission_time' => $h['paypal-transmission-time'] ?? '',
-            'cert_url' => $h['paypal-cert-url'] ?? '',
-            'auth_algo' => $h['paypal-auth-algo'] ?? '',
-            'transmission_sig' => $h['paypal-transmission-sig'] ?? '',
-            'webhook_id' => $this->webhookId,
-            'webhook_event' => $event,
-        ]);
-
-        [$code, $body] = $this->request(
-            'POST',
-            '/v1/notifications/verify-webhook-signature',
-            (string) $verifyPayload,
-            ['Content-Type: application/json', "Authorization: Bearer $token"],
-        );
-
-        $json = json_decode($body, true);
-
-        return $code >= 200 && $code < 300
-            && is_array($json)
-            && ($json['verification_status'] ?? '') === 'SUCCESS';
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -561,6 +723,12 @@ final class PaypalDriver implements PaymentProvider
     // -------------------------------------------------------------------------
 
     /** @inheritdoc */
+    public function webhookSignatureHeader(): string
+    {
+        return 'paypal-transmission-sig';
+    }
+
+    /** @inheritdoc */
     public function settlementModel(): string
     {
         return 'gateway';
@@ -577,6 +745,11 @@ final class PaypalDriver implements PaymentProvider
      */
     private function getAccessToken(): string
     {
+        // The OAuth token is valid for ~9 hours: reuse it until a minute before it expires, instead of one token
+        // request per webhook (which also doubles the outbound calls an unauthenticated caller can provoke).
+        if ($this->cachedToken !== null && $this->now() < $this->cachedTokenExpiresAt) {
+            return $this->cachedToken;
+        }
         [$code, $body] = $this->request(
             'POST',
             '/v1/oauth2/token',
@@ -589,8 +762,18 @@ final class PaypalDriver implements PaymentProvider
         if ($code < 200 || $code >= 300 || !is_array($json) || empty($json['access_token'])) {
             throw new PaymentException("PayPal token request failed (HTTP $code)");
         }
+        $ttl = isset($json['expires_in']) && is_numeric($json['expires_in']) ? (int) $json['expires_in'] : 0;
+        $this->cachedToken = (string) $json['access_token'];
+        $this->cachedTokenExpiresAt = $this->now() + max(0, $ttl - 60);
 
-        return (string) $json['access_token'];
+        return $this->cachedToken;
+    }
+
+    /** Forget the cached token (after a 401 from PayPal). */
+    private function forgetToken(): void
+    {
+        $this->cachedToken = null;
+        $this->cachedTokenExpiresAt = 0;
     }
 
     /**
@@ -601,6 +784,9 @@ final class PaypalDriver implements PaymentProvider
      */
     private function request(string $method, string $path, string $body, array $headers, ?string $basicAuth = null): array
     {
+        if ($this->transport !== null) {
+            return ($this->transport)($method, $this->baseUrl . $path, $body, $headers, $basicAuth);
+        }
         $ch = curl_init($this->baseUrl . $path);
         $opts = [
             CURLOPT_CUSTOMREQUEST => $method,

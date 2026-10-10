@@ -21,7 +21,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 \echo '--- exactly one PENDING to_central/invoice_issued row, payload amount 58882 -> ok=t ---'
 SELECT (count(*)=1 AND max(status)='pending' AND max(event_type)='invoice_issued' AND max(direction)='to_central'
@@ -38,7 +38,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 \echo '--- INSIDE the txn: invoice present AND its one pending outbox row present -> ok=t ---'
 SELECT ((SELECT count(*) FROM inv_invoices WHERE invoice_number='INV-000699')=1
@@ -89,7 +89,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 -- the relay claimed it, the POST to central errored -> mark_failed with a backoff instant
 SELECT inv_outbox_mark_failed(
@@ -134,7 +134,7 @@ SELECT inv_issue_invoice(
     ROW('Sri Medicals',NULL,'buyer','unregistered','Karnataka',NULL)::inv_party_input,
     'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-09-01',
     ARRAY[ROW('Professional Plan — Monthly','998314','1','499.00',0.18,NULL,false)::inv_line_input],
-    NULL, 'seed', '2026-09-01', 'issued'
+    NULL, 'seed', '2026-09-01', 'issued', p_mode => 'live'
 ) AS invoice_id;
 -- forward-intimate central, then make the product invoice due so it can be settled
 SELECT inv_outbox_deliver(

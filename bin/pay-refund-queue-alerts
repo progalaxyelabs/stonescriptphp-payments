@@ -1,0 +1,29 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Raise the ageing alert for refund-queue entries that have stayed open too long.
+ *
+ *   pay-refund-queue-alerts --bootstrap=/path/to/monitor.php [--limit=100]
+ *
+ * The bootstrap file is the application's own: it loads its autoloader and configuration and RETURNS a configured
+ * StoneScriptPay\Http\Webhook\RefundQueueMonitor. Prints the number of alerts delivered. Suitable for an hourly or daily cron.
+ */
+
+use StoneScriptPay\Http\Webhook\RefundQueueMonitor;
+
+$opts = getopt('', ['bootstrap:', 'limit::']);
+if (!isset($opts['bootstrap']) || !is_string($opts['bootstrap']) || !is_file($opts['bootstrap'])) {
+    fwrite(STDERR, "usage: pay-refund-queue-alerts --bootstrap=/path/to/monitor.php [--limit=100]\n");
+    exit(1);
+}
+$job = require $opts['bootstrap'];
+if (!$job instanceof RefundQueueMonitor) {
+    fwrite(STDERR, 'the bootstrap file must return a ' . RefundQueueMonitor::class . "\n");
+    exit(1);
+}
+$limit = isset($opts['limit']) ? max(1, (int) $opts['limit']) : 100;
+echo 'delivered ' . $job->run($limit) . " refund-queue ageing alert(s)\n";
+exit(0);

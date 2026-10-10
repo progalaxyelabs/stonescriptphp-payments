@@ -1,0 +1,475 @@
+-- stonescriptphp-payments :: TEST - issuers, numbering series, gapless allocator,
+-- test/live separation, immutability (L7.1).
+--
+-- STRICT: this file sets ON_ERROR_STOP itself, so the first failed assertion aborts
+-- it with a non-zero exit and tests/run-suite.sh fails the run. A passing run
+-- prints one 'ok:' line per assertion and ends with 'ALL L7.1 SQL ASSERTIONS PASSED'.
+--
+-- The multi-process proofs (1000 concurrent issuances, commit/rollback mixes,
+-- concurrent draft issues) live in tests/shell/l7_1_numbering.sh.
+\set ON_ERROR_STOP on
+\set tenant_a '''00000000-0000-0000-0000-0000000a0001'''
+\set platform '''l71platform'''
+
+-- ---------- helpers (session-local) ----------
+CREATE FUNCTION pg_temp.t_assert(p_ok BOOLEAN, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    IF p_ok IS NOT TRUE THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: %', p_label;
+    END IF;
+    RAISE NOTICE 'ok: %', p_label;
+END; $$ LANGUAGE plpgsql;
+
+-- runs a statement that must fail with the given SQLSTATE (and nothing else)
+CREATE FUNCTION pg_temp.t_expect(p_sql TEXT, p_state TEXT, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    BEGIN
+        EXECUTE p_sql;
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE = p_state THEN
+            RAISE NOTICE 'ok: % (raised %)', p_label, p_state;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but got % (%)', p_label, p_state, SQLSTATE, SQLERRM;
+    END;
+    RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but nothing was raised', p_label, p_state;
+END; $$ LANGUAGE plpgsql;
+
+-- a standard domestic invoice from a series: Rs 100 + 18% GST
+CREATE FUNCTION pg_temp.t_issue(p_series TEXT, p_mode TEXT, p_issue_at TIMESTAMPTZ,
+                                p_status TEXT DEFAULT 'issued', p_tenant UUID DEFAULT '00000000-0000-0000-0000-0000000a0001',
+                                p_rate NUMERIC DEFAULT 0.18)
+RETURNS BIGINT AS $$
+    SELECT inv_issue_invoice(
+        NULL, p_tenant, 'l71platform', 'test', NULL,
+        p_issue_at, p_issue_at, p_issue_at + interval '30 days',
+        'IN', 'Karnataka',
+        NULL,
+        ROW('Buyer One', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+        'domestic', NULL, false, false,
+        'INR', NULL, NULL,
+        p_issue_at,
+        ARRAY[ROW('Service','998314','1','100.00',p_rate,NULL,false)::inv_line_input],
+        NULL, 'test', p_issue_at, p_status, p_series, p_mode);
+$$ LANGUAGE sql;
+
+CREATE FUNCTION pg_temp.t_num(p_id BIGINT) RETURNS TEXT AS $$
+    SELECT invoice_number FROM inv_invoices WHERE id = p_id;
+$$ LANGUAGE sql;
+
+CREATE FUNCTION pg_temp.t_last(p_series TEXT, p_fy TEXT) RETURNS BIGINT AS $$
+    SELECT coalesce((SELECT c.last_number FROM inv_series_counter c JOIN inv_series s ON s.id = c.series_id
+                      WHERE s.series_code = p_series AND c.fy_label = p_fy), 0);
+$$ LANGUAGE sql;
+
+-- the suite issues documents dated across several financial years: widen the date window for this
+-- database (the window itself is tested at the end)
+UPDATE inv_gst_config SET config_value = '36500' WHERE config_key IN ('issue_date_window_days_live', 'issue_date_window_days_test');
+SELECT _inv_in_fy_label(now()) AS cur_fy \gset
+
+\echo '======== issuers and series definitions ========'
+SELECT _inv_issuer_upsert('acme-live', :platform, NULL, 'Acme Services Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester') AS live_issuer \gset
+SELECT _inv_issuer_upsert('acme-draft', :platform, NULL, 'Acme (placeholder)', 'regular', '29AAACX1234C1ZP', '29', NULL, true, 'tester') AS placeholder_issuer \gset
+SELECT _inv_issuer_upsert('solo-unreg', :platform, :tenant_a, 'Solo Consultant', 'unregistered', NULL, '29', 'Mysuru', false, 'tester') AS unreg_issuer \gset
+
+SELECT pg_temp.t_assert((SELECT is_placeholder FROM inv_issuers WHERE issuer_code = 'acme-draft'), 'placeholder issuer is flagged');
+SELECT pg_temp.t_expect($$SELECT _inv_issuer_upsert('acme-live', 'otherplatform', NULL, 'X', 'regular', '29AAACX1234C1ZP', '29', NULL, false, 't')$$,
+    'PY014', 'issuer ownership cannot be changed');
+SELECT pg_temp.t_expect($$SELECT _inv_issuer_upsert('nogstin', 'l71platform', NULL, 'X', 'regular', NULL, '29', NULL, false, 't')$$,
+    'PY014', 'a registered issuer cannot be made live without a GSTIN');
+SELECT pg_temp.t_expect($$SELECT _inv_issuer_upsert('bad code!', 'l71platform', NULL, 'X', 'regular', NULL, NULL, NULL, true, 't')$$,
+    'PY014', 'issuer code charset enforced');
+
+SELECT _inv_series_create('acme-inv',  'acme-live',  'invoice', 'live', 'AB',     '/', 5, true,  'tester') AS s_live \gset
+SELECT _inv_series_create('acme-test', 'acme-live',  'invoice', 'test', 'TESTA', '/', 4, true,  'tester') AS s_test \gset
+SELECT _inv_series_create('acme-cont', 'acme-live',  'invoice', 'live', 'CN',     '-', 4, false, 'tester') AS s_cont \gset
+SELECT _inv_series_create('draft-live','acme-draft', 'invoice', 'live', 'DR',     '/', 5, true,  'tester') AS s_ph_live \gset
+SELECT _inv_series_create('draft-test','acme-draft', 'invoice', 'test', 'TESTD', '/', 4, true,  'tester') AS s_ph_test \gset
+SELECT _inv_series_create('solo-inv',  'solo-unreg', 'invoice', 'live', 'SC',     '/', 4, true,  'tester') AS s_solo \gset
+
+SELECT pg_temp.t_assert(_inv_series_create('acme-inv', 'acme-live', 'invoice', 'live', 'AB', '/', 5, true, 'tester') = :s_live,
+    'creating the identical series again is idempotent (same id)');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('acme-inv', 'acme-live', 'invoice', 'live', 'AB', '/', 6, true, 't')$$,
+    'PY014', 'a different definition under an existing code is refused');
+-- AB(2) + '/' + '99-99' + '/' + 12 nines = 21 > 16
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('too-long', 'acme-live', 'invoice', 'live', 'ABCDEFG', '/', 6, true, 't')$$,
+    'ER040', 'a series whose longest number can exceed 16 characters is rejected at creation');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('too-long2', 'acme-live', 'invoice', 'live', 'ZZ', '/', 12, true, 't')$$,
+    'ER040', 'width pushes the longest number past 16 -> rejected at creation');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('bad-chars', 'acme-live', 'invoice', 'live', 'A#', '/', 4, true, 't')$$,
+    'ER040', 'a prefix with a character outside the allowed set is rejected at creation');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('bad-test', 'acme-live', 'invoice', 'test', 'QA', '/', 4, true, 't')$$,
+    'PY014', 'a test series must have a TEST prefix');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('bad-live', 'acme-live', 'invoice', 'live', 'TEST9', '/', 4, true, 't')$$,
+    'PY014', 'a live series may never have a TEST prefix');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('bad-live2', 'acme-live', 'invoice', 'live', 'test9', '/', 4, true, 't')$$,
+    'PY014', 'the TEST prefix rule is case-insensitive');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('overlap', 'acme-live', 'invoice', 'live', 'AB/26-27', '/', 4, false, 't')$$,
+    'PY014', 'a series head that extends another series head is refused (could mint the same string)');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('overlap2', 'acme-live', 'invoice', 'live', 'AB', '', 4, false, 't')$$,
+    'PY014', 'a series head that is a prefix of another series head is refused');
+SELECT pg_temp.t_expect($$SELECT _inv_series_create('nobody', 'no-such-issuer', 'invoice', 'live', 'NB', '/', 4, true, 't')$$,
+    'PY010', 'an unknown issuer is refused');
+
+\echo '======== gapless issuance, financial year, number format ========'
+SELECT pg_temp.t_issue('acme-inv', 'live', '2026-10-10 10:00+05:30') AS i1 \gset
+SELECT pg_temp.t_issue('acme-inv', 'live', '2026-10-11 10:00+05:30') AS i2 \gset
+SELECT pg_temp.t_issue('acme-inv', 'live', '2026-10-12 10:00+05:30') AS i3 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:i1) = 'AB/26-27/00001' AND pg_temp.t_num(:i2) = 'AB/26-27/00002' AND pg_temp.t_num(:i3) = 'AB/26-27/00003',
+    'three issuances give AB/26-27/00001..00003');
+SELECT pg_temp.t_assert((SELECT fy_label = '26-27' AND number_seq = 1 AND mode = 'live' AND series_id = :s_live AND issue_date = '2026-10-10'
+                           FROM inv_invoices WHERE id = :i1), 'the serial, FY, mode, series and document date are stored on the invoice');
+SELECT pg_temp.t_assert((SELECT length(invoice_number) <= 16 FROM inv_invoices WHERE id = :i1), 'number is within 16 characters');
+
+-- rollback never burns a number
+BEGIN;
+SELECT pg_temp.t_issue('acme-inv', 'live', '2026-10-13 10:00+05:30') AS rolled \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:rolled) = 'AB/26-27/00004', 'inside the transaction the next number is 00004');
+ROLLBACK;
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '26-27') = 3, 'after ROLLBACK the counter is unchanged (3)');
+SELECT pg_temp.t_issue('acme-inv', 'live', '2026-10-13 10:00+05:30') AS i4 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:i4) = 'AB/26-27/00004', 'the number released by the rollback is issued next, no gap');
+
+-- a failure INSIDE issuance (bad line) after the number is taken must not burn it either
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '26-27') = 4, 'counter is 4 before the failing-issuance probe');
+DO $$
+BEGIN
+    BEGIN
+        PERFORM inv_issue_invoice(NULL, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+            '2026-10-14', '2026-10-14', '2026-11-14', 'IN', 'Karnataka', NULL,
+            ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+            'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-14',
+            ARRAY[ROW('Bad','998314','1','100.00',0.17,NULL,false)::inv_line_input],
+            NULL, 'test', '2026-10-14', 'issued', 'acme-inv', 'live');
+        RAISE EXCEPTION 'ASSERTION FAILED: an invalid line was accepted';
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE 'ASSERTION FAILED%' THEN RAISE; END IF;
+    END;
+END $$;
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '26-27') = 4, 'an issuance that fails after allocating leaves the counter at 4 (not burned)');
+
+-- financial year rollover (IST): 31-Mar 23:30 IST is FY 26-27, 01-Apr 00:30 IST is FY 27-28
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-03-31 23:30+05:30') AS i_mar \gset
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-04-01 00:30+05:30') AS i_apr \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:i_mar) = 'AB/26-27/00005', 'last minute of the FY (IST) still belongs to 26-27');
+SELECT pg_temp.t_assert(pg_temp.t_num(:i_apr) = 'AB/27-28/00001', 'first minute of the next FY (IST) starts a fresh counter at 1');
+-- the same instants expressed in UTC give the same answer (session time zone never matters)
+SET TIME ZONE 'UTC';
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-03-31 19:00+00') AS i_apr2 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:i_apr2) = 'AB/27-28/00002', '19:00 UTC on 31-Mar is 00:30 IST on 01-Apr -> FY 27-28');
+RESET TIME ZONE;
+-- continuous (no fy_reset) series keeps counting across FYs and embeds no FY
+SELECT pg_temp.t_issue('acme-cont', 'live', '2027-03-31 12:00+05:30') AS c1 \gset
+SELECT pg_temp.t_issue('acme-cont', 'live', '2027-04-02 12:00+05:30') AS c2 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:c1) = 'CN-0001' AND pg_temp.t_num(:c2) = 'CN-0002', 'a series without fy_reset continues across the FY boundary');
+
+\echo '======== TEST and live can never share a series ========'
+SELECT pg_temp.t_issue('acme-test', 'test', '2026-10-10 10:00+05:30') AS t1 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:t1) = 'TESTA/26-27/0001', 'a test series mints TEST-prefixed numbers');
+SELECT pg_temp.t_assert((SELECT mode = 'test' FROM inv_invoices WHERE id = :t1), 'the invoice row records mode=test');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-inv', 'test', '2026-10-10 10:00+05:30')$$, 'PY012', 'a test-mode document cannot draw a live number');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-test', 'live', '2026-10-10 10:00+05:30')$$, 'PY012', 'a live-mode document cannot draw a test number');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-inv', NULL, '2026-10-10 10:00+05:30')$$, 'PY012', 'an undetermined mode is refused, never assumed');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_allocate('acme-inv', '2026-10-10', 'live')$$, 'PY041', 'the allocator cannot be called directly (no burning a serial without issuing)');
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '26-27') = 5 AND pg_temp.t_last('acme-test', '26-27') = 1,
+    'refused attempts moved neither counter');
+-- the row guard is a second line of defence behind the allocator
+SELECT pg_temp.t_expect($$UPDATE inv_invoices SET mode = 'test' WHERE id = (SELECT min(id) FROM inv_invoices WHERE mode = 'live')$$,
+    'PY019', 'the mode of an issued invoice cannot be flipped');
+SELECT pg_temp.t_expect($$INSERT INTO inv_invoices (invoice_number, tenant_id, platform_code, charge_source, document_type, tax_treatment,
+    taxable_value_minor, gross_total_minor, currency, billing_country_code, status, created_by, mode)
+    VALUES ('TEST-AB/26-27/99999', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'x', 'tax_invoice', 'intrastate', 1, 1, 'INR', 'IN', 'issued', 't', 'live')$$,
+    'PY012', 'a live-mode row cannot carry a TEST number');
+SELECT pg_temp.t_expect($$INSERT INTO inv_invoices (invoice_number, tenant_id, platform_code, charge_source, document_type, tax_treatment,
+    taxable_value_minor, gross_total_minor, currency, billing_country_code, status, created_by, mode)
+    VALUES ('AB/26-27/99999', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'x', 'tax_invoice', 'intrastate', 1, 1, 'INR', 'IN', 'issued', 't', 'test')$$,
+    'PY012', 'a test-mode row cannot carry a non-TEST number');
+
+\echo '======== placeholder issuer ========'
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('draft-live', 'live', '2026-10-10 10:00+05:30')$$, 'PY013', 'a live series refuses to issue while its issuer is a placeholder');
+SELECT pg_temp.t_assert(pg_temp.t_last('draft-live', '26-27') = 0, 'the refused live issuance consumed nothing');
+SELECT pg_temp.t_issue('draft-test', 'test', '2026-10-10 10:00+05:30') AS ph_t1 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:ph_t1) = 'TESTD/26-27/0001', 'a placeholder issuer can still issue TEST documents');
+-- once the issuer becomes real, the live series works
+SELECT _inv_issuer_upsert('acme-draft', :platform, NULL, 'Acme Real Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester');
+SELECT pg_temp.t_issue('draft-live', 'live', '2026-10-10 10:00+05:30') AS ph_l1 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:ph_l1) = 'DR/26-27/00001', 'after the issuer is made real the live series issues from 1');
+
+\echo '======== seller resolution and the two numbering paths ========'
+SELECT pg_temp.t_assert((SELECT seller_legal_name = 'Acme Services Pvt Ltd' AND seller_gstin = '29AAACX1234C1ZP'
+                                AND seller_registration_status = 'regular' AND seller_state_code = '29' AND seller_address = 'Bengaluru'
+                                AND buyer_legal_name = 'Buyer One' AND buyer_state_code = '29' AND issuer_id = :live_issuer
+                           FROM inv_invoices WHERE id = :i1), 'seller (from the issuer) and buyer are snapshotted onto the invoice');
+-- editing the issuer afterwards cannot rewrite the issued document
+SELECT _inv_issuer_upsert('acme-live', :platform, NULL, 'Renamed Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Elsewhere', false, 'tester');
+SELECT pg_temp.t_assert((SELECT seller_legal_name = 'Acme Services Pvt Ltd' AND seller_address = 'Bengaluru' FROM inv_invoices WHERE id = :i1),
+    'an issuer edit after issue does not change the issued invoice snapshot');
+SELECT pg_temp.t_expect($$SELECT inv_issue_invoice(NULL, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Someone Else', '27AAACX1234C1ZQ', 'seller', 'regular', 'Maharashtra', '27')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', '2026-10-10', 'issued', 'acme-inv', 'live')$$,
+    'PY015', 'a seller that contradicts the series issuer is refused');
+SELECT pg_temp.t_expect($$SELECT inv_issue_invoice('X-1', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka', NULL,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', '2026-10-10', 'issued', 'acme-inv', 'live')$$,
+    'PY016', 'an explicit number together with a series is refused');
+SELECT pg_temp.t_expect($$SELECT inv_issue_invoice(NULL, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test')$$,
+    'PY016', 'neither a number nor a series is refused');
+-- the explicit-number (import) path keeps working, flagged by series_id NULL
+SELECT inv_issue_invoice('LEGACY-000001', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', '2026-10-10', 'issued', NULL, 'live') AS legacy_id \gset
+SELECT pg_temp.t_assert((SELECT series_id IS NULL AND invoice_number = 'LEGACY-000001' AND seller_legal_name = 'Acme' FROM inv_invoices WHERE id = :legacy_id),
+    'the explicit-number path still works and is recognisable (series_id NULL)');
+-- unregistered seller (tenant-issued): plain invoice, no tax, no GSTIN needed
+SELECT pg_temp.t_issue('solo-inv', 'live', '2026-10-10 10:00+05:30', 'issued', :tenant_a, 0) AS u1 \gset
+SELECT pg_temp.t_assert((SELECT invoice_number = 'SC/26-27/0001' AND document_type = 'bill_of_supply' AND gross_total_minor = 10000
+                                AND seller_registration_status = 'unregistered' AND seller_gstin IS NULL
+                           FROM inv_invoices WHERE id = :u1), 'an unregistered issuer issues a plain no-tax document without a GSTIN');
+
+\echo '======== drafts take no number until issued ========'
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-05-01 10:00+05:30', 'draft') AS d1 \gset
+SELECT pg_temp.t_assert((SELECT invoice_number IS NULL AND number_seq IS NULL AND status = 'draft' AND series_id = :s_live FROM inv_invoices WHERE id = :d1),
+    'a draft from a series has no number');
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '27-28') = 2, 'creating a draft did not advance the counter');
+SELECT inv_transition_invoice_status(:d1, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'cancelled', 'tester', '2027-05-02 10:00+05:30');
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '27-28') = 2, 'cancelling a draft burned no number');
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-05-01 10:00+05:30', 'draft') AS d2 \gset
+SELECT inv_transition_invoice_status(:d2, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'issued', 'tester', '2027-05-03 10:00+05:30');
+SELECT pg_temp.t_assert((SELECT invoice_number = 'AB/27-28/00003' AND number_seq = 3 AND fy_label = '27-28' AND status = 'issued'
+                                AND issue_date = '2027-05-03' AND issued_at = '2027-05-03 10:00+05:30'
+                           FROM inv_invoices WHERE id = :d2), 'the number is allocated at the draft -> issued edge, dated by the issue moment');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM inv_outbox WHERE invoice_id = :d2 AND payload->>'invoice_number' = 'AB/27-28/00003'),
+    'the outbox intimation raised at the edge already carries the allocated number');
+-- a draft of a LIVE series whose issuer is a placeholder cannot be issued
+SELECT _inv_issuer_upsert('acme-draft', :platform, NULL, 'Acme (back to placeholder)', 'regular', '29AAACX1234C1ZP', '29', NULL, true, 'tester');
+SELECT pg_temp.t_issue('draft-live', 'live', '2027-05-01 10:00+05:30', 'draft') AS d3 \gset
+SELECT pg_temp.t_expect(format($f$SELECT inv_transition_invoice_status(%s, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'issued', 't', '2027-05-04 10:00+05:30')$f$, :d3),
+    'PY013', 'issuing a draft of a live series refuses while the issuer is a placeholder');
+SELECT pg_temp.t_assert((SELECT invoice_number IS NULL AND status = 'draft' FROM inv_invoices WHERE id = :d3), 'the refused edge left the draft untouched');
+-- a draft may be deleted (no number was taken)
+DELETE FROM inv_invoice_lines WHERE invoice_id = :d3;
+DELETE FROM inv_invoices WHERE id = :d3;
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM inv_invoices WHERE id = :d3), 'a draft (and its lines) can be deleted');
+
+\echo '======== immutability ========'
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET invoice_number = ''AB/26-27/77777'' WHERE id = %s', :i1), 'PY019', 'UPDATE of invoice_number is rejected');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET invoice_number = NULL WHERE id = %s', :i1), 'PY019', 'clearing invoice_number is rejected');
+SELECT pg_temp.t_expect(format('DELETE FROM inv_invoices WHERE id = %s', :i1), 'PY019', 'DELETE of an issued invoice is rejected');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET gross_total_minor = 1 WHERE id = %s', :i1), 'PY019', 'the amounts of an issued invoice are frozen');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET seller_gstin = ''27AAACX1234C1ZQ'' WHERE id = %s', :i1), 'PY019', 'the seller snapshot of an issued invoice is frozen');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET series_id = %s WHERE id = %s', :s_cont, :i1), 'PY019', 'the series of an issued invoice cannot change');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoice_lines SET unit_price_minor = 1 WHERE invoice_id = %s', :i1), 'PY019', 'the lines of an issued invoice are frozen');
+SELECT pg_temp.t_expect(format('DELETE FROM inv_invoice_lines WHERE invoice_id = %s', :i1), 'PY019', 'the lines of an issued invoice cannot be deleted');
+-- the lifecycle itself still works
+SELECT inv_transition_invoice_status(:i2, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'due', 'tester', '2026-11-12 10:00+05:30');
+SELECT inv_transition_invoice_status(:i2, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'void', 'tester', '2026-11-13 10:00+05:30');
+SELECT pg_temp.t_assert((SELECT status = 'void' AND invoice_number = 'AB/26-27/00002' FROM inv_invoices WHERE id = :i2),
+    'voiding works and the number stays in the books');
+SELECT pg_temp.t_expect(format('DELETE FROM inv_invoices WHERE id = %s', :i2), 'PY019', 'a voided invoice cannot be deleted either');
+SELECT pg_temp.t_assert(pg_temp.t_last('acme-inv', '26-27') = 5, 'void/cancel never touches the counter');
+-- a NULL snapshot column on a row issued before the columns existed can be back-filled once
+INSERT INTO inv_invoices (invoice_number, tenant_id, platform_code, charge_source, document_type, tax_treatment,
+    taxable_value_minor, gross_total_minor, currency, billing_country_code, status, created_by, issued_at)
+VALUES ('OLD-000001', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'x', 'tax_invoice', 'intrastate', 1, 1, 'INR', 'IN', 'issued', 't', '2026-01-01');
+UPDATE inv_invoices SET seller_gstin = '29AAACX1234C1ZP', seller_legal_name = 'Acme' WHERE invoice_number = 'OLD-000001';
+SELECT pg_temp.t_assert((SELECT seller_gstin = '29AAACX1234C1ZP' FROM inv_invoices WHERE invoice_number = 'OLD-000001'), 'a NULL snapshot column of a pre-existing row can be back-filled');
+SELECT pg_temp.t_expect($$UPDATE inv_invoices SET seller_gstin = '27AAACX1234C1ZQ' WHERE invoice_number = 'OLD-000001'$$, 'PY019', 'once back-filled the snapshot never changes');
+
+\echo '======== counter and series row guards ========'
+SELECT pg_temp.t_expect($$UPDATE inv_series_counter SET last_number = 1 WHERE last_number > 2$$, 'PY018', 'a counter can never be moved backwards by hand');
+SELECT pg_temp.t_expect($$DELETE FROM inv_series_counter WHERE last_number > 0$$, 'PY019', 'a counter that has issued cannot be deleted');
+SELECT pg_temp.t_expect($$UPDATE inv_series SET prefix = 'ZZ' WHERE series_code = 'acme-inv'$$, 'PY019', 'a series definition is immutable');
+SELECT pg_temp.t_expect($$UPDATE inv_series SET mode = 'test' WHERE series_code = 'acme-inv'$$, 'PY019', 'a series cannot be flipped between live and test');
+SELECT pg_temp.t_expect($$DELETE FROM inv_series WHERE series_code = 'acme-inv'$$, 'PY019', 'a series is never deleted');
+UPDATE inv_series SET is_active = false WHERE series_code = 'draft-test';
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('draft-test', 'test', '2026-10-10 10:00+05:30')$$, 'PY011', 'an inactive series refuses to issue');
+UPDATE inv_series SET is_active = true WHERE series_code = 'draft-test';
+
+\echo '======== adopting an existing series ========'
+SELECT _inv_series_create('legacy-cont', 'acme-live', 'invoice', 'live', 'LG', '-', 5, false, 'tester');
+SELECT pg_temp.t_assert((SELECT o_previous_last = 0 AND o_new_last = 1234 FROM _inv_series_adopt('legacy-cont', NULL, 1234, 'ledger export 2026-09-30', 'tester')),
+    'adopt sets the counter to the last number used elsewhere');
+SELECT pg_temp.t_issue('legacy-cont', 'live', '2026-10-10 10:00+05:30') AS a1 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:a1) = 'LG-01235', 'the first library number is exactly last+1');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('legacy-cont', NULL, 1000, 'attempt backwards', 'tester')$$, 'PY018', 'adopt refuses to move a counter backwards');
+SELECT pg_temp.t_assert((SELECT o_previous_last = 1235 AND o_new_last = 1235 FROM _inv_series_adopt('legacy-cont', NULL, 1235, 'same again', 'tester')),
+    'adopting the current value is a no-op');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(adopted_last) = 1234 AND max(adopted_by) = 'tester' AND max(evidence_ref) = 'ledger export 2026-09-30'
+                           FROM inv_series_adoptions a JOIN inv_series s ON s.id = a.series_id WHERE s.series_code = 'legacy-cont'),
+    'adoption logged who, what and the evidence (once; the no-op logged nothing)');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('legacy-cont', NULL, 2000, '', 'tester')$$, 'PY014', 'adopt requires evidence');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('legacy-cont', NULL, 2000, 'e', '')$$, 'PY014', 'adopt requires an actor');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('legacy-cont', '26-27', 2000, 'e', 't')$$, 'PY014', 'a continuous series takes no FY label');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('acme-inv', NULL, 10, 'e', 't')$$, 'PY014', 'an FY series needs the FY label');
+SELECT _inv_series_create('adopt-fy', 'acme-live', 'invoice', 'live', 'AF', '/', 5, true, 'tester');
+SELECT pg_temp.t_issue('adopt-fy', 'live', now()) AS af1 \gset
+SELECT pg_temp.t_issue('adopt-fy', 'live', now()) AS af2 \gset
+SELECT pg_temp.t_expect(format('SELECT * FROM _inv_series_adopt(''adopt-fy'', %L, 1, ''e'', ''t'')', :'cur_fy'), 'PY018', 'adopt below the counter / existing serials is refused');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('legacy-cont', NULL, 100000, 'e', 't')$$, 'PY014', 'adopt beyond the series width is refused');
+SELECT pg_temp.t_expect($$UPDATE inv_series_adoptions SET evidence_ref = 'x'$$, 'PY019', 'the adoption log is append-only');
+-- adopting a series onto numbers that already sit in inv_invoices must not re-issue them
+SELECT inv_issue_invoice('IM-0007', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', '2026-10-10', 'issued', NULL, 'live');
+-- numbers imported BEFORE their series exists (the only order the explicit path allows)
+SELECT _inv_series_create('imp', 'acme-live', 'invoice', 'live', 'IM', '-', 4, false, 'tester');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('imp', NULL, 5, 'e', 't')$$, 'PY018', 'adopt below an existing stored serial (IM-0007) is refused');
+SELECT inv_issue_invoice('IQ-0001', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input,
+    'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', '2026-10-10', 'issued', NULL, 'live');
+SELECT _inv_series_create('iq', 'acme-live', 'invoice', 'live', 'IQ', '-', 4, false, 'tester');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('iq', 'live', '2026-10-10 10:00+05:30')$$, 'PY017',
+    'a series whose counter is behind an existing number refuses instead of colliding');
+SELECT pg_temp.t_assert(pg_temp.t_last('iq', '') = 0, 'the refused collision left the counter at 0');
+SELECT * FROM _inv_series_adopt('imp', NULL, 7, 'ledger', 't');
+SELECT pg_temp.t_issue('imp', 'live', '2026-10-10 10:00+05:30') AS im1 \gset
+SELECT pg_temp.t_assert(pg_temp.t_num(:im1) = 'IM-0008', 'after adopting over an existing number the series continues at 8');
+
+\echo '======== the lawful-number format is enforced by data, not hope ========'
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM inv_invoices WHERE invoice_number IS NOT NULL AND length(invoice_number) > 16),
+    'no stored number is longer than 16 characters');
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM inv_invoices WHERE series_id IS NOT NULL AND invoice_number IS NOT NULL
+                                      AND mode = 'live' AND upper(left(invoice_number, 4)) = 'TEST'),
+    'no live series invoice carries a TEST number');
+SELECT pg_temp.t_assert((SELECT count(*) = count(DISTINCT invoice_number) FROM inv_invoices WHERE invoice_number IS NOT NULL), 'every number is unique');
+
+
+\echo '======== review fixes: status regression, two-statement bypass ========'
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-05-02 10:00+05:30') AS rg \gset
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET status = ''draft'' WHERE id = %s', :rg), 'PY019', 'an issued invoice cannot be set back to draft');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET status = ''cancelled'' WHERE id = %s', :rg), 'PY019', 'issued -> cancelled is not a legal edge');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET status = ''paid'' WHERE id = %s', :rg), 'PY019', 'issued -> paid directly is not a legal edge');
+-- the two-statement bypass: regress to draft, then delete. Both statements must fail, and the row survives.
+DO $$
+DECLARE v_id BIGINT := (SELECT id FROM inv_invoices WHERE invoice_number = 'AB/27-28/00004');
+BEGIN
+    BEGIN UPDATE inv_invoices SET status = 'draft' WHERE id = v_id; EXCEPTION WHEN SQLSTATE 'PY019' THEN NULL; END;
+    BEGIN DELETE FROM inv_invoices WHERE id = v_id; EXCEPTION WHEN SQLSTATE 'PY019' THEN NULL; END;
+    IF NOT EXISTS (SELECT 1 FROM inv_invoices WHERE id = v_id AND status = 'issued') THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: the two-statement bypass removed or changed an issued invoice';
+    END IF;
+    RAISE NOTICE 'ok: regress-then-delete cannot remove an issued invoice';
+END $$;
+
+\echo '======== review fixes: lines ========'
+SELECT pg_temp.t_expect(format($f$INSERT INTO inv_invoice_lines (invoice_id, line_no, description, hsn_sac, quantity_milli, unit_price_minor, gst_rate, taxable_value_minor, line_total_minor)
+    VALUES (%s, 9, 'smuggled', '998314', 1000, 100, 0.18, 100, 118)$f$, :rg), 'PY019', 'a line cannot be added to an issued invoice');
+SELECT pg_temp.t_issue('acme-inv', 'live', '2027-05-02 11:00+05:30', 'draft') AS dr \gset
+SELECT pg_temp.t_expect(format('UPDATE inv_invoice_lines SET invoice_id = %s WHERE invoice_id = %s', :rg, :dr), 'PY019', 'a line cannot be re-pointed to another invoice');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoice_lines SET invoice_id = %s WHERE invoice_id = %s', :dr, :rg), 'PY019', 'a line cannot be pulled out of an issued invoice');
+
+\echo '======== review fixes: back-fill only on legacy rows ========'
+INSERT INTO inv_invoices (invoice_number, tenant_id, platform_code, charge_source, document_type, tax_treatment, taxable_value_minor, gross_total_minor, currency,
+    billing_country_code, status, created_by, issued_at, mode, series_id, issuer_id, fy_label, number_seq)
+VALUES ('AB/26-27/90001', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'x', 'tax_invoice', 'intrastate', 1, 1, 'INR', 'IN', 'issued', 't', '2026-01-01',
+        'live', :s_live, :live_issuer, '26-27', 90001);
+SELECT pg_temp.t_expect($$UPDATE inv_invoices SET seller_gstin = '29AAACX1234C1ZP' WHERE invoice_number = 'AB/26-27/90001'$$, 'PY019', 'a series-issued row is never back-filled');
+SELECT pg_temp.t_expect(format('UPDATE inv_invoices SET series_id = %s WHERE invoice_number = ''OLD-000001''', :s_live), 'PY019', 'a legacy row cannot be attached to a series either');
+UPDATE inv_invoices SET buyer_gstin = NULL WHERE invoice_number = 'OLD-000001';
+
+\echo '======== review fixes: legacy NULL mode is live; mode back-fill ========'
+SELECT pg_temp.t_assert((SELECT mode IS NULL FROM inv_invoices WHERE invoice_number = 'OLD-000001'), 'the legacy fixture row has mode NULL');
+SELECT pg_temp.t_expect($$INSERT INTO inv_invoices (invoice_number, tenant_id, platform_code, charge_source, document_type, tax_treatment, taxable_value_minor, gross_total_minor, currency,
+    billing_country_code, status, created_by, issued_at) VALUES ('TEST-LEGACY-1', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'x', 'tax_invoice', 'intrastate', 1, 1, 'INR', 'IN', 'issued', 't', '2026-01-01')$$,
+    'PY012', 'a NULL-mode row is treated as live: a TEST number cannot be inserted into it');
+SELECT pg_temp.t_assert((SELECT count(*) >= 1 FROM _pay_apply_schema_upgrades() WHERE change LIKE '%back-filled with mode%'), '_pay_apply_schema_upgrades back-fills legacy rows with mode');
+SELECT pg_temp.t_assert((SELECT mode = 'live' FROM inv_invoices WHERE invoice_number = 'OLD-000001'), 'a legacy non-TEST row becomes live');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM _pay_apply_schema_upgrades()), 'and a second run changes nothing');
+
+\echo '======== review fixes: explicit-number path ========'
+SELECT pg_temp.t_expect($$SELECT inv_issue_invoice('NOSERIES-1', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input, 'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test')$$, 'PY012', 'an explicit number must carry a mode');
+SELECT pg_temp.t_expect($$SELECT inv_issue_invoice('TEST-OOPS-1', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input, 'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', p_mode => 'live')$$, 'PY012', 'a TEST string can never land in a live row');
+SELECT pg_temp.t_expect($$SELECT inv_issue_invoice('AB/26-27/55555', '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'test', NULL,
+    '2026-10-10', '2026-10-10', '2026-11-10', 'IN', 'Karnataka',
+    ROW('Acme', '29AAACX1234C1ZP', 'seller', 'regular', 'Karnataka', '29')::inv_party_input,
+    ROW('B', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input, 'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-10',
+    ARRAY[ROW('S','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'test', p_mode => 'live')$$, 'PY016', 'an explicit number inside a series head is refused');
+
+\echo '======== review fixes: adopt validation and dry run ========'
+SELECT pg_temp.t_expect(format('SELECT * FROM _inv_series_adopt(''adopt-fy'', %L, 10, ''e'', ''t'')', '26-28'), 'PY014', 'FY typo 26-28 (second year not first + 1)');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('adopt-fy', '2627', 10, 'e', 't')$$, 'PY014', 'FY typo 2627');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('adopt-fy', '99-00', 10, 'e', 't')$$, 'PY014', 'a far-away FY (99-00) is refused');
+SELECT pg_temp.t_expect($$SELECT * FROM _inv_series_adopt('adopt-fy', '20-21', 10, 'e', 't')$$, 'PY014', 'an FY more than one year from the current one is refused');
+SELECT pg_temp.t_assert((SELECT o_applied = false AND o_previous_last = 2 AND o_new_last = 50 FROM _inv_series_adopt('adopt-fy', :'cur_fy', 50, 'dry', 't', now(), true)), 'dry run reports what it would do');
+SELECT pg_temp.t_assert(pg_temp.t_last('adopt-fy', :'cur_fy') = 2 AND NOT EXISTS (SELECT 1 FROM inv_series_adoptions a JOIN inv_series s ON s.id = a.series_id WHERE s.series_code = 'adopt-fy'),
+    'and changed nothing and logged nothing');
+SELECT pg_temp.t_assert((SELECT o_applied FROM _inv_series_adopt('adopt-fy', :'cur_fy', 50, 'real', 't')), 'the real adopt then applies');
+
+\echo '======== review fixes: gap audit ========'
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM inv_series_gap_audit('solo-inv')), 'a healthy series has no findings');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM inv_series_gap_audit('adopt-fy')), 'serials adopted from elsewhere are not reported as missing');
+ALTER TABLE inv_series_counter DISABLE TRIGGER inv_series_counter_guard;
+UPDATE inv_series_counter SET last_number = last_number + 2 WHERE series_id = (SELECT id FROM inv_series WHERE series_code = 'acme-cont');
+ALTER TABLE inv_series_counter ENABLE TRIGGER inv_series_counter_guard;
+SELECT pg_temp.t_assert((SELECT array_agg(o_serial ORDER BY o_serial) = ARRAY[3,4]::bigint[] AND min(o_finding) = 'missing_serial' FROM inv_series_gap_audit('acme-cont')),
+    'a counter pushed past the books is reported serial by serial');
+
+\echo '======== review fixes: document-date window (live strict, test wider) ========'
+UPDATE inv_gst_config SET config_value = '0' WHERE config_key = 'issue_date_window_days_live';
+UPDATE inv_gst_config SET config_value = '7' WHERE config_key = 'issue_date_window_days_test';
+SELECT pg_temp.t_assert(pg_temp.t_num(pg_temp.t_issue('acme-inv', 'live', now())) IS NOT NULL, 'a live document dated now is numbered');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-inv', 'live', now() + interval '2 days')$$, 'PY042', 'a live document dated 2 days ahead is refused (default window 0 = today only)');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-inv', 'live', now() - interval '2 days')$$, 'PY042', 'a live document dated 2 days back is refused');
+SELECT pg_temp.t_assert(pg_temp.t_num(pg_temp.t_issue('acme-test', 'test', now() - interval '3 days')) LIKE 'TESTA/%', 'a TEST document may be dated within the wider test window');
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-test', 'test', now() + interval '30 days')$$, 'PY042', 'but not a month away');
+UPDATE inv_gst_config SET config_value = '2' WHERE config_key = 'issue_date_window_days_live';
+SELECT pg_temp.t_assert(pg_temp.t_num(pg_temp.t_issue('acme-inv', 'live', now() - interval '2 days')) IS NOT NULL, 'the live window is configuration: widened to 2 days it accepts 2 days back');
+UPDATE inv_gst_config SET config_value = '36500' WHERE config_key IN ('issue_date_window_days_live', 'issue_date_window_days_test');
+
+\echo '======== review fixes: schema-current check, truncate ========'
+SELECT pg_temp.t_expect($$TRUNCATE inv_invoices CASCADE$$, 'PY019', 'inv_invoices cannot be truncated');
+SELECT pg_temp.t_expect($$TRUNCATE inv_series_counter$$, 'PY019', 'counters cannot be truncated');
+SELECT pg_temp.t_expect($$TRUNCATE inv_series_adoptions$$, 'PY019', 'the adoption log cannot be truncated');
+SELECT pg_temp.t_expect($$TRUNCATE inv_invoice_lines$$, 'PY019', 'lines cannot be truncated');
+SELECT pg_temp.t_expect($$TRUNCATE inv_payments$$, 'PY019', 'payments cannot be truncated');
+
+\echo '======== review fixes: draft edge re-validates the basis ========'
+SELECT _inv_issuer_upsert('edge-iss', :platform, NULL, 'Edge Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'x', false, 'tester');
+SELECT _inv_series_create('edge-inv', 'edge-iss', 'invoice', 'live', 'ED', '/', 5, true, 'tester');
+SELECT pg_temp.t_issue('edge-inv', 'live', now(), 'draft') AS ed1 \gset
+SELECT _inv_issuer_upsert('edge-iss', :platform, NULL, 'Edge Pvt Ltd', 'composition', '29AAACX1234C1ZP', '29', 'x', false, 'tester');
+SELECT pg_temp.t_expect(format('SELECT inv_transition_invoice_status(%s, ''00000000-0000-0000-0000-0000000a0001'', ''l71platform'', ''issued'', ''t'', now())', :ed1),
+    'PY015', 'a draft is not numbered after the seller registration changed under it');
+SELECT pg_temp.t_assert(pg_temp.t_last('edge-inv', :'cur_fy') = 0, 'and burned no serial');
+SELECT _inv_issuer_upsert('edge-iss', :platform, NULL, 'Edge Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'x', false, 'tester');
+SELECT pg_temp.t_assert((SELECT inv_transition_invoice_status(:ed1, '00000000-0000-0000-0000-0000000a0001', 'l71platform', 'issued', 't', now())) = 'issued', 'unchanged basis: the draft issues');
+SELECT pg_temp.t_issue('edge-inv', 'live', now(), 'draft') AS ed2 \gset
+DELETE FROM inv_gst_rate_slabs WHERE rate = 0.18;
+SELECT pg_temp.t_expect(format('SELECT inv_transition_invoice_status(%s, ''00000000-0000-0000-0000-0000000a0001'', ''l71platform'', ''issued'', ''t'', now())', :ed2),
+    'PY015', 'a draft whose GST rate is no longer an allowed slab is not numbered');
+INSERT INTO inv_gst_rate_slabs (rate) VALUES (0.18);
+
+\echo '======== review fixes: schema-behind error is clear ========'
+BEGIN;
+ALTER TABLE inv_invoices DROP COLUMN buyer_state_code;
+SELECT pg_temp.t_expect($$SELECT pg_temp.t_issue('acme-inv', 'live', now())$$, 'PY040', 'issuing against a database without the upgrade raises the clear PY040');
+ROLLBACK;
+
+\echo 'ALL L7.1 SQL ASSERTIONS PASSED'

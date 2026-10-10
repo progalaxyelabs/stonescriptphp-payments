@@ -1,0 +1,456 @@
+-- stonescriptphp-payments :: TEST - orders, idempotent order creation and the single
+-- exactly-once capture path pay_apply_capture (L7.3). STRICT (sets ON_ERROR_STOP itself).
+-- The 50-way concurrent redelivery proofs are in tests/shell/l7_3_apply_capture.sh.
+--
+-- Hand-derived amounts (integer paise), GST 18% intrastate (buyer and seller both Karnataka):
+--   subscription  Rs 499.00 excl.  taxable 49900, GST 8982 (CGST 4491 + SGST 4491)  gross 58882
+--   licence       Rs 1999.00 excl. taxable 199900, GST 35982 (17991 + 17991)         gross 235882
+--   wallet pack   10 credits x Rs 49.00 = 490.00 excl.  taxable 49000, GST 8820      gross 57820
+\set ON_ERROR_STOP on
+UPDATE inv_gst_config SET config_value = '36500' WHERE config_key IN ('issue_date_window_days_live', 'issue_date_window_days_test');
+UPDATE pay_config SET config_value = '4000000000' WHERE config_key = 'pay_clock_skew_seconds';
+UPDATE pay_config SET config_value = '100000000' WHERE config_key = 'ent_late_apply_grace_hours';
+\set tenant_a '''00000000-0000-0000-0000-0000000b0001'''
+\set tenant_b '''00000000-0000-0000-0000-0000000b0002'''
+\set platform '''l73platform'''
+
+CREATE FUNCTION pg_temp.t_assert(p_ok BOOLEAN, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    IF p_ok IS NOT TRUE THEN RAISE EXCEPTION 'ASSERTION FAILED: %', p_label; END IF;
+    RAISE NOTICE 'ok: %', p_label;
+END; $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pg_temp.t_expect(p_sql TEXT, p_state TEXT, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    BEGIN
+        EXECUTE p_sql;
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE = p_state THEN RAISE NOTICE 'ok: % (raised %)', p_label, p_state; RETURN; END IF;
+        RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but got % (%)', p_label, p_state, SQLSTATE, SQLERRM;
+    END;
+    RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but nothing was raised', p_label, p_state;
+END; $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pg_temp.finish_row(p_id BIGINT) RETURNS VOID AS $$
+BEGIN
+    PERFORM * FROM pay_webhook_claim(p_id);
+    PERFORM * FROM pay_webhook_mark(p_id, 'applied');
+END; $$ LANGUAGE plpgsql;
+
+-- a NEW capture that disagrees with its order is not raised away: it returns refund_required and is queued as review_mismatch
+CREATE FUNCTION pg_temp.t_mismatch(p_sql TEXT, p_txn TEXT, p_label TEXT) RETURNS VOID AS $$
+DECLARE v_out TEXT;
+BEGIN
+    EXECUTE 'SELECT o_outcome FROM ' || regexp_replace(p_sql, '^SELECT \* FROM ', '') || ' x' INTO v_out;
+    IF v_out IS DISTINCT FROM 'refund_required' THEN RAISE EXCEPTION 'ASSERTION FAILED: % - outcome was %', p_label, v_out; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pay_refund_queue WHERE gateway_txn_ref = p_txn AND reason = 'review_mismatch' AND status = 'open') THEN
+        RAISE EXCEPTION 'ASSERTION FAILED: % - no review_mismatch queue entry for %', p_label, p_txn;
+    END IF;
+    RAISE NOTICE 'ok: % (refund_required + queued)', p_label;
+END; $$ LANGUAGE plpgsql;
+
+-- everything the money path can write, as one comparable fingerprint
+CREATE FUNCTION pg_temp.t_state() RETURNS TEXT AS $$
+    SELECT (SELECT count(*) FROM inv_invoices)::text || '/' || (SELECT count(*) FROM inv_payments) || '/'
+        || (SELECT count(*) FROM pay_captured_payments) || '/' || (SELECT count(*) FROM customer_pricing_plans) || '/'
+        || (SELECT count(*) FROM wlt_grants) || '/' || (SELECT count(*) FROM pay_events) || '/'
+        || (SELECT coalesce(sum(last_number), 0) FROM inv_series_counter) || '/'
+        || (SELECT count(*) FROM pay_orders WHERE status = 'paid');
+$$ LANGUAGE sql;
+
+\echo '======== fixtures: issuer, series, catalog ========'
+SELECT _inv_issuer_upsert('ord-live', :platform, NULL, 'Acme Services Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester');
+SELECT _inv_issuer_upsert('ord-ph', :platform, NULL, 'Not Yet Real', 'regular', '29AAACX1234C1ZP', '29', NULL, true, 'tester');
+SELECT _inv_series_create('ord-inv',  'ord-live', 'invoice', 'live', 'OR',    '/', 5, true, 'tester');
+SELECT _inv_series_create('ord-test', 'ord-live', 'invoice', 'test', 'TESTO', '/', 4, true, 'tester');
+SELECT _inv_series_create('ph-inv',   'ord-ph',   'invoice', 'live', 'PH',    '/', 5, true, 'tester');
+
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (9001, 'Monthly', true, true, false, '2026-01-01', 'seed'),
+    (9002, 'Lifetime licence', false, true, false, '2026-01-01', 'seed'),
+    (9003, 'Credit wallet', false, true, false, '2026-01-01', 'seed'),
+    (9004, 'Odd wallet', false, true, false, '2026-01-01', 'seed'),
+    (9005, 'Retired', true, false, false, '2026-01-01', 'seed');
+INSERT INTO subscription_pricing_plans (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by) VALUES
+    (9001, 9001, 1, 'month', 49900, true, false, true, '2026-01-01', 'seed'),
+    (9005, 9005, 1, 'month', 49900, true, false, true, '2026-01-01', 'seed');
+INSERT INTO one_time_pricing_plans (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, credit_quantity, amount, is_amount_tax_exclusive, is_active, created_at, created_by) VALUES
+    (9002, 9002, NULL, NULL, true, false, NULL, 199900, true, true, '2026-01-01', 'seed');
+INSERT INTO wlt_packs (id, pricing_plan_id, name, credits_milli, validity_duration, validity_uom, created_by) VALUES
+    (9003, 9003, 'Ten credits', 10000, NULL, NULL, 'seed'),
+    (9004, 9004, 'Doomed pack', 10000, NULL, NULL, 'seed');
+
+-- spec builders
+CREATE FUNCTION pg_temp.spec(p_desc TEXT, p_sac TEXT, p_price TEXT) RETURNS TEXT AS $$
+    SELECT jsonb_build_object(
+        'buyer', jsonb_build_object('legal_name', 'Buyer One', 'registration_status', 'unregistered', 'address_state', 'Karnataka'),
+        'billing_country_code', 'IN', 'billing_state', 'Karnataka', 'supply_type', 'domestic',
+        'price_is_inclusive', false, 'round_off', false, 'due_days', 0,
+        'lines', jsonb_build_array(jsonb_build_object('description', p_desc, 'hsn_sac', p_sac, 'quantity', '1', 'unit_price', p_price, 'gst_rate', 0.18))
+    )::text;
+$$ LANGUAGE sql;
+
+\echo '======== order creation: idempotent, validated up front ========'
+SELECT o_order_ref AS sub_ref, o_is_new AS sub_new FROM pay_order_create(:tenant_a, :platform, 'key-sub-1', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_assert(:'sub_new'::boolean AND :'sub_ref' LIKE 'ord\_%' AND length(:'sub_ref') = 36, 'a new order gets a library order_ref (fits the gateway receipt limit)');
+SELECT pg_temp.t_assert((SELECT status = 'created' AND amount_minor = 58882 AND mode = 'live' AND gateway_code = 'razorpay' AND invoice_id IS NULL
+                           FROM pay_orders WHERE order_ref = :'sub_ref'), 'the order is created with its server-fixed amount and mode');
+SELECT pg_temp.t_assert((SELECT o_order_ref = :'sub_ref' AND o_is_new = false FROM pay_order_create(:tenant_a, :platform, 'key-sub-1', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')),
+    'client retry with the same idempotency key returns the SAME order');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_orders WHERE idempotency_key = 'key-sub-1'), 'and still exactly one order row');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'key-sub-1', 'subscription_period', '9001', NULL,
+    58883, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY036', 'the same key for a DIFFERENT request is refused');
+SELECT pg_temp.t_assert((SELECT o_is_new FROM pay_order_create(:tenant_b, :platform, 'key-sub-1', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')),
+    'the same key under another tenant is a different order');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-bad-amt', 'subscription_period', '9001', NULL,
+    50000, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY034', 'a quoted amount that is not what the invoice will total is refused at creation');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-retired', 'subscription_period', '9005', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY030', 'a plan that is not sellable is refused');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-ph', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ph-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY013', 'no live order while the invoice issuer is a placeholder (money is never taken for an invoice that cannot be issued)');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-mode', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'test', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY012', 'a test-mode order cannot use a live series');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-nomode', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', NULL, 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY012', 'an unknown mode is refused, never assumed');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-purpose', 'gift', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY030', 'the purposes are a closed set');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-gw', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'nogateway', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'ER058', 'an unknown gateway is refused');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', '', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a),
+    'PY030', 'an idempotency key is required');
+
+-- attach the gateway order: first wins, both callers end with the same id
+SELECT pg_temp.t_assert((SELECT o_attached AND o_gateway_order_id = 'order_AAA' AND o_status = 'open' FROM pay_order_attach_gateway_order(:'sub_ref', 'order_AAA')),
+    'the first attach opens the order');
+SELECT pg_temp.t_assert((SELECT NOT o_attached AND o_gateway_order_id = 'order_AAA' FROM pay_order_attach_gateway_order(:'sub_ref', 'order_BBB')),
+    'a second (racing) attach loses and gets the winner back');
+SELECT pg_temp.t_assert((SELECT o_gateway_order_id = 'order_AAA' AND NOT o_is_new AND o_status = 'open' FROM pay_order_create(:tenant_a, :platform, 'key-sub-1', 'subscription_period', '9001', NULL,
+    58882, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')),
+    'a retry after the attach returns the same order WITH its gateway order id');
+SELECT pg_temp.t_expect(format($f$UPDATE pay_orders SET gateway_order_id = 'other' WHERE order_ref = %L$f$, :'sub_ref'), 'PY022', 'the gateway order id never changes');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_order_get(:'sub_ref', :tenant_a, :platform)), 'the owner can read the order for polling');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_order_get(:'sub_ref', :tenant_b, :platform)), 'another tenant sees no row');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_order_get(:'sub_ref', :tenant_a, 'otherplatform')), 'another platform sees no row');
+
+\echo '======== capture: mismatches write nothing but a refund-queue entry ========'
+SELECT pg_temp.t_state() AS before_state \gset
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_bad1', %L, NULL, NULL, 58881, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'), 'pay_bad1', 'a different amount is refused');
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_bad2', %L, NULL, NULL, 58882, 'USD', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'), 'pay_bad2', 'a different currency is refused');
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_bad3', %L, %L, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref', :tenant_b), 'pay_bad3', 'a different tenant is refused');
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_bad4', %L, NULL, 'otherplatform', 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'), 'pay_bad4', 'a different platform is refused');
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('paypal', 'pay_bad5', %L, NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'), 'pay_bad5', 'a different gateway is refused');
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_bad6', %L, NULL, NULL, 58882, 'INR', 'test', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'), 'pay_bad6', 'a capture in the other mode (test vs live) is refused');
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_bad7', %L, NULL, NULL, 58882, 'INR', NULL, '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'), 'pay_bad7', 'a capture of unknown mode is refused');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'before_state', 'every refusal applied nothing: no invoice, number, payment, capture, entitlement, event');
+SELECT pg_temp.t_assert((SELECT count(*) = 7 FROM pay_refund_queue WHERE gateway_txn_ref LIKE 'pay_bad%' AND reason = 'review_mismatch'), 'each mismatching transaction is in the refund queue exactly once');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'refund_required' FROM pay_apply_capture('razorpay', 'pay_bad1', :'sub_ref', NULL, NULL, 58881, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30'))
+                    AND (SELECT count(*) = 7 FROM pay_refund_queue WHERE gateway_txn_ref LIKE 'pay_bad%'), 'a redelivered mismatch does not queue a second entry');
+
+\echo '======== capture: unknown order is unattributed, never applied ========'
+SELECT pg_temp.t_assert((SELECT o_outcome = 'unattributed' FROM pay_apply_capture('razorpay', 'pay_x1', 'ord_doesnotexist', NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')),
+    'a capture for an unknown order is unattributed');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'unattributed' FROM pay_apply_capture('razorpay', 'pay_x2', NULL, NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30')),
+    'a capture with no order reference is unattributed');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'before_state', 'and nothing was applied');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_x1' AND reason = 'unattributed' AND order_ref = 'ord_doesnotexist')
+                    AND (SELECT count(*) = 0 FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_x2'),
+    'an order reference of ours that matches no order is queued as unattributed money; a capture with no reference at all (a foreign payment) is not');
+
+\echo '======== capture: subscription_period applied exactly once ========'
+SELECT o_outcome AS outcome, o_invoice_id AS sub_inv, o_payment_id AS sub_pay FROM pay_apply_capture('razorpay', 'pay_sub1', :'sub_ref', :tenant_a, :platform,
+    58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'webhook:razorpay', '{"id":"pay_sub1"}', p_issued_at => '2026-10-10 10:00+05:30') \gset
+SELECT pg_temp.t_assert(:'outcome' = 'applied', 'the capture is applied');
+SELECT pg_temp.t_assert((SELECT invoice_number = 'OR/26-27/00001' AND status = 'paid' AND gross_total_minor = 58882 AND taxable_value_minor = 49900
+                                AND cgst_minor = 4491 AND sgst_minor = 4491 AND mode = 'live' AND charge_source = 'subscription_period'
+                                AND charge_ref = :'sub_ref' AND tenant_id = :tenant_a::uuid AND paid_at = '2026-10-10 10:00+05:30'
+                                AND seller_gstin = '29AAACX1234C1ZP' AND buyer_legal_name = 'Buyer One'
+                           FROM inv_invoices WHERE id = :sub_inv), 'a paid GST invoice with the next gapless number was issued from the order spec');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(amount_minor) = 58882 AND max(status) = 'success' FROM inv_payments WHERE invoice_id = :sub_inv), 'exactly one payment on the invoice');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM customer_pricing_plans WHERE tenant_id = :tenant_a::uuid AND platform_code = :platform AND subscription_pricing_plan_id = 9001
+                                AND started_at = '2026-10-10 10:00+05:30'), 'the subscription period was granted');
+SELECT pg_temp.t_assert((SELECT status = 'paid' AND invoice_id = :sub_inv AND payment_id = :sub_pay AND paid_at IS NOT NULL AND captured_payment_id IS NOT NULL
+                           FROM pay_orders WHERE order_ref = :'sub_ref'), 'the order is paid and linked to its invoice and payment');
+SELECT pg_temp.t_assert((SELECT count(*) FILTER (WHERE event_type = 'payment.applied') = 1 AND count(*) FILTER (WHERE event_type = 'entitlement.changed') = 1
+                           FROM pay_events WHERE order_ref = :'sub_ref'), 'payment.applied and entitlement.changed were appended once each');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM inv_outbox WHERE invoice_id = :sub_inv), 'the invoice intimation was enqueued once (existing outbox)');
+
+SELECT pg_temp.t_state() AS applied_state \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'already_applied' AND o_invoice_id = :sub_inv AND o_payment_id = :sub_pay
+                           FROM pay_apply_capture('razorpay', 'pay_sub1', :'sub_ref', :tenant_a, :platform, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'webhook:razorpay', NULL, p_issued_at => '2026-10-10 10:00+05:30')),
+    'redelivering the same capture reports already_applied with the original ids');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'applied_state', 'and applies nothing a second time');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_sub1', %L, NULL, NULL, 99999, 'INR', 'live', '2026-10-10 10:00+05:30', 'x', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'sub_ref'),
+    'PY033', 'a known transaction reported with a different amount is an error');
+
+\echo '======== a second DIFFERENT payment for a paid order goes to the refund queue ========'
+SELECT pg_temp.t_assert((SELECT o_outcome = 'refund_required' AND o_detail LIKE 'order_not_open:%'
+                           FROM pay_apply_capture('razorpay', 'pay_sub2', :'sub_ref', NULL, NULL, 58882, 'INR', 'live', '2026-10-10 11:00+05:30', 'x', p_issued_at => '2026-10-10 11:00+05:30')),
+    'a duplicate payment for a paid order returns refund_required (a human must refund it)');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'applied_state' AND NOT EXISTS (SELECT 1 FROM pay_captured_payments WHERE gateway_txn_ref = 'pay_sub2'),
+    'it applied nothing: no capture record, invoice, payment, entitlement or event');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(status) = 'open' AND max(reason) = 'order_not_open' AND max(amount_minor) = 58882 AND max(order_ref) = :'sub_ref'
+                           FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_sub2'), 'but it is visible in the refund queue');
+SELECT * FROM pay_apply_capture('razorpay', 'pay_sub2', :'sub_ref', NULL, NULL, 58882, 'INR', 'live', '2026-10-10 11:00+05:30', 'x', p_issued_at => '2026-10-10 11:00+05:30');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_sub2'), 'a redelivery does not add a second queue entry');
+SELECT pg_temp.t_expect($$SELECT _pay_refund_queue_resolve((SELECT id FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_sub2'), 'refunded', '', 'x')$$, 'PY020', 'closing an entry needs an actor');
+SELECT _pay_refund_queue_resolve((SELECT id FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_sub2'), 'refunded', 'ops', 'refunded in the gateway dashboard');
+SELECT pg_temp.t_assert((SELECT status = 'refunded' AND resolved_by = 'ops' FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_sub2'), 'a resolved entry records who and why');
+SELECT pg_temp.t_expect($$SELECT _pay_refund_queue_resolve((SELECT id FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_sub2'), 'dismissed', 'ops', 'x')$$, 'PY021', 'a closed entry cannot be reopened or re-closed');
+
+\echo '======== a payment recorded for an order that never took effect is NOT already_applied ========'
+SELECT o_order_ref AS cna_ref FROM pay_order_create(:tenant_a, :platform, 'key-cna', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT * FROM pay_record_captured_payment('razorpay', 'pay_cna', :'cna_ref', 58882, 'INR', 'success', '2026-10-10 10:00+05:30', 'direct');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'captured_not_applied' AND o_detail LIKE '%nothing was fulfilled%'
+                           FROM pay_apply_capture('razorpay', 'pay_cna', :'cna_ref', NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'x', p_issued_at => '2026-10-10 10:00+05:30')),
+    'a recorded capture whose order is not paid is reported as captured_not_applied, never already_applied');
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM inv_invoices WHERE charge_ref = :'cna_ref'), 'and nothing was invented for it');
+
+\echo '======== stacking: a renewal before expiry extends, one more invoice, next number ========'
+SELECT o_order_ref AS sub2_ref FROM pay_order_create(:tenant_a, :platform, 'key-sub-2', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM pay_apply_capture('razorpay', 'pay_sub3', :'sub2_ref', NULL, NULL, 58882, 'INR', 'live', '2026-10-20 10:00+05:30', 'webhook:razorpay', p_issued_at => '2026-10-20 10:00+05:30')),
+    'a second period is applied');
+SELECT pg_temp.t_assert((SELECT count(*) = 2 AND min(started_at) = '2026-10-10 10:00+05:30' AND max(started_at) = '2026-11-10 10:00+05:30'
+                           FROM customer_pricing_plans WHERE tenant_id = :tenant_a::uuid AND subscription_pricing_plan_id = 9001), 'the renewal starts when the first period ends (time stacks)');
+SELECT pg_temp.t_assert((SELECT invoice_number = 'OR/26-27/00002' FROM inv_invoices WHERE charge_ref = :'sub2_ref'), 'the second invoice took the next number');
+
+\echo '======== one_time_license and wallet_topup ========'
+SELECT o_order_ref AS lic_ref FROM pay_order_create(:tenant_a, :platform, 'key-lic', 'one_time_license', '9002', NULL, 235882, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('Licence', '998314', '1999.00'), 'tester') \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM pay_apply_capture('razorpay', 'pay_lic', :'lic_ref', NULL, NULL, 235882, 'INR', 'live', '2026-10-11 10:00+05:30', 'webhook:razorpay', p_issued_at => '2026-10-11 10:00+05:30')), 'the licence capture is applied');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM customer_pricing_plans WHERE tenant_id = :tenant_a::uuid AND one_time_pricing_plan_id = 9002), 'the one-time plan was enrolled once');
+SELECT pg_temp.t_assert((SELECT gross_total_minor = 235882 AND cgst_minor = 17991 AND sgst_minor = 17991 AND status = 'paid' FROM inv_invoices WHERE charge_ref = :'lic_ref'), 'licence invoice totals match the hand-derived figures');
+
+SELECT o_order_ref AS wal_ref FROM pay_order_create(:tenant_a, :platform, 'key-wal', 'wallet_topup', '9003', NULL, 57820, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('10 credits', '998314', '490.00'), 'tester') \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM pay_apply_capture('razorpay', 'pay_wal', :'wal_ref', NULL, NULL, 57820, 'INR', 'live', '2026-10-12 10:00+05:30', 'webhook:razorpay', p_issued_at => '2026-10-12 10:00+05:30')), 'the wallet top-up capture is applied');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(g.granted_milli) = 10000 AND max(g.amount_paid) = 49000 AND max(g.source) = 'topup' AND max(g.gateway_txn_ref) = 'pay_wal'
+                           FROM wlt_grants g JOIN wlt_wallets w ON w.id = g.wallet_id WHERE w.tenant_id = :tenant_a::uuid), 'exactly one wallet grant of 10 credits (10000 milli-credits) for the taxable value, bound to the capture');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_events WHERE order_ref = :'wal_ref' AND event_type = 'wallet.credited'), 'wallet.credited appended once');
+
+\echo '======== a paid top-up that cannot be fulfilled is queued, never lost, and rolls everything back (no burned number) ========'
+SELECT o_order_ref AS odd_ref FROM pay_order_create(:tenant_a, :platform, 'key-odd', 'wallet_topup', '9004', NULL, 57820, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('10 credits', '998314', '490.00'), 'tester') \gset
+UPDATE wlt_packs SET is_active = false WHERE id = 9004;                       -- the pack is withdrawn between order and payment
+SELECT pg_temp.t_state() AS pre_odd \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'refund_required' AND o_detail LIKE 'wallet_unfulfillable:%'
+                           FROM pay_apply_capture('razorpay', 'pay_odd', :'odd_ref', NULL, NULL, 57820, 'INR', 'live', '2026-10-13 10:00+05:30', 'webhook:razorpay', p_issued_at => '2026-10-13 10:00+05:30')),
+    'the capture is refund_required (wallet_unfulfillable), not an exception that leaves the money in the inbox');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'pre_odd', 'the invoice, its number, the payment, the capture record and the event were all rolled back');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_odd' AND reason = 'wallet_unfulfillable' AND status = 'open'), 'and the paid money sits in the refund queue');
+SELECT pg_temp.t_assert((SELECT status = 'open' OR status = 'created' FROM pay_orders WHERE order_ref = :'odd_ref'), 'the order stays unpaid');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'key-odd2', 'wallet_topup', '9004', NULL, 57820, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('10 credits', '998314', '490.00'), 'tester')$f$, :tenant_a),
+    'PY030', 'a new order for the withdrawn pack is refused up front');
+
+\echo '======== invoice_payment: invoice-first ========'
+SELECT inv_issue_invoice(NULL, :tenant_b, :platform, 'postpaid', 'm-2026-09', '2026-09-01', '2026-09-30', '2026-10-30', 'IN', 'Karnataka', NULL,
+    ROW('Buyer Two', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input, 'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-01',
+    ARRAY[ROW('Usage','998314','1','100.00',0.18,NULL,false)::inv_line_input], NULL, 'tester', '2026-10-01', 'issued', 'ord-inv', 'live') AS ip_inv \gset
+-- NOTE: this is the FIRST inv_invoice_payability call of the session and the invoice is NOT payable: a
+-- regression test for the 'record v_gw is not assigned yet' defect (the function used to fail whenever a
+-- fresh session's first call was for a non-payable invoice).
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-ip-early', 'invoice_payment', NULL, %s, 11800, 'INR', 'razorpay', 'live', NULL, NULL, 'tester')$f$, :tenant_b, :ip_inv),
+    'PY030', 'an invoice that is only issued (not yet due) is not payable');
+SELECT inv_transition_invoice_status(:ip_inv, :tenant_b, :platform, 'due', 'tester', '2026-10-30');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-ip-amt', 'invoice_payment', NULL, %s, 11799, 'INR', 'razorpay', 'live', NULL, NULL, 'tester')$f$, :tenant_b, :ip_inv),
+    'PY030', 'the order amount must equal the invoice total');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-ip-ten', 'invoice_payment', NULL, %s, 11800, 'INR', 'razorpay', 'live', NULL, NULL, 'tester')$f$, :tenant_a, :ip_inv),
+    'ER067', 'another tenant cannot open an order for this invoice');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-ip-mode', 'invoice_payment', NULL, %s, 11800, 'INR', 'razorpay', 'test', NULL, NULL, 'tester')$f$, :tenant_b, :ip_inv),
+    'PY012', 'a live invoice cannot be paid through a test-mode order');
+SELECT o_order_ref AS ip_ref FROM pay_order_create(:tenant_b, :platform, 'k-ip', 'invoice_payment', NULL, :ip_inv, 11800, 'INR', 'razorpay', 'live', NULL, NULL, 'tester') \gset
+SELECT pg_temp.t_state() AS pre_ip \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' AND o_invoice_id = :ip_inv FROM pay_apply_capture('razorpay', 'pay_ip', :'ip_ref', :tenant_b, :platform, 11800, 'INR', 'live', '2026-10-31 10:00+05:30', 'webhook:razorpay', p_issued_at => '2026-10-31 10:00+05:30')),
+    'the capture settles the existing invoice');
+SELECT pg_temp.t_assert((SELECT status = 'paid' AND paid_at = '2026-10-31 10:00+05:30' FROM inv_invoices WHERE id = :ip_inv)
+                    AND (SELECT count(*) = 1 FROM inv_payments WHERE invoice_id = :ip_inv)
+                    AND (SELECT count(*) FROM inv_invoices) = (SELECT count(*) FROM inv_invoices) , 'invoice is paid with one payment');
+SELECT pg_temp.t_assert((SELECT sum(last_number) FROM inv_series_counter) = (SELECT split_part(:'pre_ip', '/', 7)::bigint), 'and no new number was allocated');
+
+\echo '======== test mode ========'
+SELECT o_order_ref AS tst_ref FROM pay_order_create(:tenant_a, :platform, 'key-tst', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'test', 'ord-test',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_mismatch(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_tst0', %L, NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'x', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'tst_ref'), 'pay_tst0', 'a live capture for a test order is refused');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM pay_apply_capture('razorpay', 'pay_tst1', :'tst_ref', NULL, NULL, 58882, 'INR', 'test', '2026-10-14 10:00+05:30', 'webhook:razorpay', p_issued_at => '2026-10-14 10:00+05:30')), 'the test-mode capture is applied');
+SELECT pg_temp.t_assert((SELECT invoice_number = 'TESTO/26-27/0001' AND mode = 'test' FROM inv_invoices WHERE charge_ref = :'tst_ref'), 'it was invoiced from the structurally separate TEST series');
+SELECT pg_temp.t_assert((SELECT last_number = 5 FROM inv_series_counter c JOIN inv_series s ON s.id = c.series_id WHERE s.series_code = 'ord-inv' AND c.fy_label = '26-27')
+                    AND (SELECT last_number = 1 FROM inv_series_counter c JOIN inv_series s ON s.id = c.series_id WHERE s.series_code = 'ord-test'), 'the live counter did not move (it stands at 5: four capture invoices + the invoice-first one; the rolled-back top-up burned none)');
+
+\echo '======== a capture recorded for one order cannot be re-pointed at another ========'
+SELECT o_order_ref AS other_ref FROM pay_order_create(:tenant_a, :platform, 'key-other', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_sub1', %L, NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'x', p_issued_at => '2026-10-10 10:00+05:30')$f$, :'other_ref'),
+    'PY033', 'the same gateway transaction cannot be applied to a different order');
+
+\echo '======== records are immutable ========'
+SELECT pg_temp.t_expect(format($f$UPDATE pay_orders SET amount_minor = 1 WHERE order_ref = %L$f$, :'sub_ref'), 'PY022', 'an order amount never changes');
+SELECT pg_temp.t_expect(format($f$DELETE FROM pay_orders WHERE order_ref = %L$f$, :'sub_ref'), 'PY022', 'an order is never deleted');
+SELECT pg_temp.t_expect(format($f$UPDATE pay_orders SET status = 'open' WHERE order_ref = %L$f$, :'sub_ref'), 'PY022', 'a paid order is final');
+SELECT pg_temp.t_expect($$UPDATE pay_events SET payload = '{}'::jsonb$$, 'PY022', 'events are append-only (update)');
+SELECT pg_temp.t_expect($$DELETE FROM pay_events$$, 'PY022', 'events are append-only (delete)');
+
+
+\echo '======== review fixes: a voided invoice, legacy NULL mode, FY rule, order guards, events carry mode ========'
+-- invoice-first order whose invoice is voided before the money arrives
+SELECT inv_issue_invoice(NULL, :tenant_b, :platform, 'postpaid', 'm-void', '2026-09-01', '2026-09-30', '2026-10-30', 'IN', 'Karnataka', NULL,
+    ROW('Buyer Two', NULL, 'buyer', 'unregistered', 'Karnataka', NULL)::inv_party_input, 'domestic', NULL, false, false, 'INR', NULL, NULL, '2026-10-01',
+    ARRAY[ROW('Usage','998314','1','200.00',0.18,NULL,false)::inv_line_input], NULL, 'tester', '2026-10-01', 'issued', 'ord-inv', 'live') AS vd_inv \gset
+SELECT inv_transition_invoice_status(:vd_inv, :tenant_b, :platform, 'due', 'tester', '2026-10-30');
+SELECT o_order_ref AS vd_ref FROM pay_order_create(:tenant_b, :platform, 'k-vd', 'invoice_payment', NULL, :vd_inv, 23600, 'INR', 'razorpay', 'live', NULL, NULL, 'tester') \gset
+SELECT inv_transition_invoice_status(:vd_inv, :tenant_b, :platform, 'void', 'tester', '2026-10-31');
+SELECT pg_temp.t_state() AS pre_vd \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'refund_required' AND o_detail LIKE 'invoice_not_payable:%'
+                           FROM pay_apply_capture('razorpay', 'pay_vd', :'vd_ref', :tenant_b, :platform, 23600, 'INR', 'live', '2026-11-01 10:00+05:30', 'webhook', p_issued_at => '2026-11-01 10:00+05:30')),
+    'a capture against a voided invoice is rolled back and returns refund_required');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'pre_vd', 'no payment, capture record or status change was written');
+SELECT pg_temp.t_assert((SELECT status = 'void' FROM inv_invoices WHERE id = :vd_inv) AND NOT EXISTS (SELECT 1 FROM inv_payments WHERE invoice_id = :vd_inv), 'the voided invoice stays void and unpaid');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(reason) = 'invoice_not_payable' FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_vd'), 'and the money is visible in the refund queue');
+SELECT pg_temp.t_assert((SELECT status IN ('created', 'open') FROM pay_orders WHERE order_ref = :'vd_ref'), 'the order is still unpaid (nothing was fulfilled)');
+
+-- a legacy invoice (mode NULL) is LIVE: a test-mode order can never settle it
+INSERT INTO inv_invoices (invoice_number, tenant_id, platform_code, charge_source, document_type, tax_treatment, taxable_value_minor, gross_total_minor, currency,
+    billing_country_code, status, created_by, issued_at, due_date)
+VALUES ('LEGACY-L73-1', :tenant_b, :platform, 'x', 'tax_invoice', 'intrastate', 10000, 11800, 'INR', 'IN', 'issued', 'legacy', '2026-01-01', '2026-02-01');
+SELECT inv_transition_invoice_status((SELECT id FROM inv_invoices WHERE invoice_number = 'LEGACY-L73-1'), :tenant_b, :platform, 'due', 'tester', '2026-02-01');
+SELECT pg_temp.t_assert((SELECT mode IS NULL FROM inv_invoices WHERE invoice_number = 'LEGACY-L73-1'), 'the legacy fixture has mode NULL');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-leg-test', 'invoice_payment', NULL, %s, 11800, 'INR', 'razorpay', 'test', NULL, NULL, 'tester')$f$,
+    :tenant_b, (SELECT id FROM inv_invoices WHERE invoice_number = 'LEGACY-L73-1')), 'PY012', 'a test-mode order cannot settle a legacy (live) invoice');
+SELECT pg_temp.t_assert((SELECT o_order_ref IS NOT NULL FROM pay_order_create(:tenant_b, :platform, 'k-leg-live', 'invoice_payment', NULL, (SELECT id FROM inv_invoices WHERE invoice_number = 'LEGACY-L73-1'), 11800, 'INR', 'razorpay', 'live', NULL, NULL, 'tester')),
+    'a live-mode order can');
+
+-- the FY rule: invoiced in the FY of the ISSUE MOMENT, not of the capture time
+SELECT _inv_series_create('fy-rule', 'ord-live', 'invoice', 'live', 'FR', '/', 5, true, 'tester');
+SELECT o_order_ref AS fy_ref FROM pay_order_create(:tenant_a, :platform, 'k-fy', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'fy-rule',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM pay_apply_capture('razorpay', 'pay_fy', :'fy_ref', NULL, NULL, 58882, 'INR', 'live',
+    '2027-03-31 20:00+05:30', 'admin:ops', p_issued_at => '2027-04-02 11:00+05:30')), 'a payment received 31 March, applied on 2 April');
+SELECT pg_temp.t_assert((SELECT invoice_number = 'FR/27-28/00001' AND issue_date = '2027-04-02' AND paid_at = '2027-03-31 20:00+05:30' FROM inv_invoices WHERE charge_ref = :'fy_ref'),
+    'is invoiced in FY 27-28 (the issue moment) while paid_at keeps the gateway capture time');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM inv_series_counter c JOIN inv_series s ON s.id = c.series_id WHERE s.series_code = 'fy-rule' AND c.fy_label = '26-27'),
+    'and FY 26-27 was never touched: nothing goes out of order across 1 April');
+-- the document-date window bites for capture-first documents too
+UPDATE inv_gst_config SET config_value = '0' WHERE config_key = 'issue_date_window_days_live';
+SELECT o_order_ref AS win_ref FROM pay_order_create(:tenant_a, :platform, 'k-win', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'fy-rule',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_apply_capture('razorpay', 'pay_win', %L, NULL, NULL, 58882, 'INR', 'live', '2030-01-01 10:00+05:30', 'x', p_issued_at => '2030-01-01 10:00+05:30')$f$, :'win_ref'),
+    'PY042', 'an issue moment far from now is refused (and rolls everything back)');
+SELECT pg_temp.t_assert(NOT EXISTS (SELECT 1 FROM pay_captured_payments WHERE gateway_txn_ref = 'pay_win'), 'with no capture record');
+UPDATE inv_gst_config SET config_value = '36500' WHERE config_key IN ('issue_date_window_days_live', 'issue_date_window_days_test');
+
+-- events carry the mode
+SELECT pg_temp.t_assert((SELECT bool_and(payload->>'mode' = 'live') FROM pay_events WHERE order_ref = :'sub_ref'), 'payment.applied and entitlement.changed carry the mode');
+SELECT pg_temp.t_assert((SELECT payload->>'mode' = 'live' FROM pay_events WHERE order_ref = :'wal_ref' AND event_type = 'wallet.credited'), 'wallet.credited carries the mode');
+
+-- order guards
+SELECT pg_temp.t_expect(format($f$UPDATE pay_orders SET invoice_id = NULL WHERE order_ref = %L$f$, :'ip_ref'), 'PY022', 'an order''s invoice never changes once set');
+SELECT o_order_ref AS cx_ref FROM pay_order_create(:tenant_a, :platform, 'k-cx', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'fy-rule',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+UPDATE pay_orders SET status = 'cancelled' WHERE order_ref = :'cx_ref';
+SELECT pg_temp.t_expect(format($f$UPDATE pay_orders SET status = 'open' WHERE order_ref = %L$f$, :'cx_ref'), 'PY022', 'a cancelled order never reopens');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'refund_required' FROM pay_apply_capture('razorpay', 'pay_cx', :'cx_ref', NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'x', p_issued_at => '2026-10-10 10:00+05:30')),
+    'a capture for a cancelled order goes to the refund queue');
+SELECT pg_temp.t_expect('TRUNCATE pay_orders CASCADE', 'PY019', 'orders cannot be truncated');
+SELECT pg_temp.t_expect('TRUNCATE pay_events', 'PY019', 'events cannot be truncated');
+SELECT pg_temp.t_expect('TRUNCATE pay_captured_payments CASCADE', 'PY019', 'captured payments cannot be truncated');
+
+-- the gateway-create lease
+SELECT o_order_ref AS ls_ref FROM pay_order_create(:tenant_a, :platform, 'k-ls', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'fy-rule',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_assert(pay_order_begin_gateway_create(:'ls_ref'), 'the first caller takes the gateway-create lease');
+SELECT pg_temp.t_assert(NOT pay_order_begin_gateway_create(:'ls_ref'), 'a second caller does not');
+SELECT pg_temp.t_assert((SELECT o_attached FROM pay_order_attach_gateway_order(:'ls_ref', 'order_lease_1')), 'the attach follows and releases it');
+SELECT pg_temp.t_assert(NOT pay_order_begin_gateway_create(:'ls_ref'), 'an order that has its gateway order needs no more creating');
+
+
+\echo '======== W2/W8: server-side raw-payload allow-list ========'
+SELECT pg_temp.t_assert(_pay_capture_raw_allowlist('not json') IS NULL AND _pay_capture_raw_allowlist(NULL) IS NULL AND _pay_capture_raw_allowlist('[1,2]') IS NULL,
+    'unparseable or non-object input stores NULL');
+SELECT _pay_capture_raw_allowlist($j${"id":"pay_ok1","order_id":"order_AAA","amount":58882,"currency":"INR","status":"captured","method":"upi","captured":true,
+    "email":"payer@example.test","contact":"+910000000000","vpa":"x@upi","card":{"last4":"4242"},"description":"secret text",
+    "notes":{"order_id":"ord_0123456789abcdef0123456789abcdef","tenant_id":"00000000-0000-0000-0000-0000000b0001","platform_code":"l73platform","email":"n@example.test","address":"1 Street"}}$j$) AS al \gset
+SELECT pg_temp.t_assert((:'al'::jsonb -> 'fields') ? 'id' AND (:'al'::jsonb -> 'fields') ? 'amount' AND (:'al'::jsonb -> 'fields' -> 'notes') ? 'tenant_id',
+    'allow-listed fields are kept');
+SELECT pg_temp.t_assert(:'al' NOT LIKE '%payer@example%' AND :'al' NOT LIKE '%+91%' AND :'al' NOT LIKE '%x@upi%' AND :'al' NOT LIKE '%4242%'
+                    AND :'al' NOT LIKE '%secret text%' AND :'al' NOT LIKE '%Street%' AND :'al' NOT LIKE '%n@example%', 'personal data is dropped, including inside notes');
+SELECT pg_temp.t_assert((_pay_capture_raw_allowlist($j${"fields":{"id":"pay_ok2","email":"a@b.test"},"body_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}$j$)) @> '{"body_sha256":"0000000000000000000000000000000000000000000000000000000000000000","fields":{"id":"pay_ok2"}}'::jsonb
+                    AND (_pay_capture_raw_allowlist($j${"fields":{"id":"pay_ok2"},"body_sha256":"not-a-hash"}$j$)) -> 'body_sha256' IS NULL, 'the {fields, body_sha256} form is accepted; a bad hash is dropped');
+SELECT pg_temp.t_assert(_pay_capture_raw_allowlist($j${"id":"has space and a@b.test","currency":"inr","status":"captured now","amount":{"value":"1;DROP","currency_code":"INR"},
+    "notes":{"order_id":"free text","tenant_id":"not-a-uuid","platform_code":"bad code!"},"custom_id":"x y"}$j$) -> 'fields' = '{"amount":{"currency_code":"INR"}}'::jsonb,
+    'a value of the wrong FORMAT is dropped, not stored');
+SELECT pg_temp.t_assert(_pay_capture_raw_allowlist('{"unknown_key":"anything","nested":{"a":1}}') -> 'fields' = '{}'::jsonb, 'unknown keys are dropped');
+SELECT pg_temp.t_assert(_pay_capture_raw_allowlist('{"id":"pay_ok3"}') ->> 'received_sha256' ~ '^[0-9a-f]{64}$', 'the hash of what was received is kept as proof');
+-- end to end: pay_apply_capture filters whatever it is handed
+SELECT o_order_ref AS al_ref FROM pay_order_create(:tenant_a, :platform, 'k-al', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM pay_apply_capture('razorpay', 'pay_al1', :'al_ref', NULL, NULL, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'x',
+        '{"id":"pay_al1","email":"leak@example.test","contact":"+911111111111","card":{"last4":"1111"}}', p_issued_at => '2026-10-10 10:00+05:30')), 'a capture with a hostile raw payload is applied');
+SELECT pg_temp.t_assert((SELECT raw_payload::text NOT LIKE '%leak@example%' AND raw_payload::text NOT LIKE '%1111%' AND raw_payload -> 'fields' ->> 'id' = 'pay_al1'
+                           FROM pay_captured_payments WHERE gateway_txn_ref = 'pay_al1'), 'arbitrary JSON cannot be stored in the captured payment');
+
+\echo '======== W2: refund-queue ageing and evidence retention ========'
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_refund_queue_aged(100)), 'a fresh queue entry is not yet aged');
+SELECT pg_temp.t_assert(_pay_config_int('refund_queue_alert_after_days') = 3 AND _pay_config_int('refund_queue_alert_repeat_hours') = 24, 'the ageing thresholds are configuration (3 days, repeat 24 hours)');
+UPDATE pay_refund_queue SET created_at = now() - interval '4 days' WHERE gateway_txn_ref = 'pay_cx';
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(o_gateway_txn_ref) = 'pay_cx' AND max(o_age_days) >= 4 FROM pay_refund_queue_aged(100)), 'an open entry older than 3 days is due for an alert');
+SELECT pay_refund_queue_alert_sent(id) FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_cx';
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_refund_queue_aged(100)), 'once alerted it is not re-alerted inside the repeat period');
+UPDATE pay_refund_queue SET last_alert_at = now() - interval '25 hours' WHERE gateway_txn_ref = 'pay_cx';
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_refund_queue_aged(100)), 'after the repeat period it is due again');
+-- raw evidence of unresolved money is not redacted
+SELECT o_id AS ev_q FROM pay_webhook_record('razorpay', 'evt_q', 'payment.captured', :platform, '{"e":"q"}', '{}',
+    '{"type":"payment.captured","gateway_txn_ref":"pay_cx","amount_minor_units":58882,"currency":"INR","order_ref":"ord_x"}') \gset
+SELECT o_id AS ev_ok FROM pay_webhook_record('razorpay', 'evt_ok', 'payment.captured', :platform, '{"e":"ok"}', '{}',
+    '{"type":"payment.captured","gateway_txn_ref":"pay_al1","amount_minor_units":58882,"currency":"INR","order_ref":"ord_y"}') \gset
+SELECT o_order_ref AS np_ref FROM pay_order_create(:tenant_a, :platform, 'k-np', 'subscription_period', '9001', NULL, 58882, 'INR', 'razorpay', 'live', 'ord-inv',
+    pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester') \gset
+SELECT * FROM pay_record_captured_payment('razorpay', 'pay_np1', :'np_ref', 58882, 'INR', 'success', '2026-10-10 10:00+05:30', 'x', NULL);
+SELECT o_id AS ev_np FROM pay_webhook_record('razorpay', 'evt_np', 'payment.captured', :platform, '{"e":"np"}', '{}',
+    '{"type":"payment.captured","gateway_txn_ref":"pay_np1","amount_minor_units":58882,"currency":"INR","order_ref":"ord_z"}') \gset
+SELECT pg_temp.finish_row(:ev_q); SELECT pg_temp.finish_row(:ev_ok); SELECT pg_temp.finish_row(:ev_np);
+ALTER TABLE pay_webhook_inbox DISABLE TRIGGER pay_webhook_inbox_guard;
+UPDATE pay_webhook_inbox SET received_at = now() - interval '14 months' WHERE id IN (:ev_q, :ev_ok, :ev_np);
+ALTER TABLE pay_webhook_inbox ENABLE TRIGGER pay_webhook_inbox_guard;
+SELECT _pay_webhook_redact_expired('tester', 1000) AS redacted_n \gset
+SELECT pg_temp.t_assert((SELECT redacted_at IS NOT NULL FROM pay_webhook_inbox WHERE id = :ev_ok), 'an expired row for a settled payment is redacted');
+SELECT pg_temp.t_assert((SELECT redacted_at IS NULL FROM pay_webhook_inbox WHERE id = :ev_q), 'an expired row whose transaction has an OPEN refund-queue entry is kept');
+SELECT pg_temp.t_assert((SELECT redacted_at IS NULL FROM pay_webhook_inbox WHERE id = :ev_np), 'an expired row whose capture is recorded but not applied is kept');
+SELECT _pay_refund_queue_resolve(id, 'refunded', 'tester', 'refunded at the gateway') FROM pay_refund_queue WHERE gateway_txn_ref = 'pay_cx';
+SELECT _pay_webhook_redact_expired('tester', 1000) AS redacted_n2 \gset
+SELECT pg_temp.t_assert(:redacted_n2 >= 1 AND (SELECT redacted_at IS NOT NULL FROM pay_webhook_inbox WHERE id = :ev_q), 'once the entry is resolved the row is redacted');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pay_refund_queue_aged(100)), 'a resolved entry is never alerted');
+
+\echo '======== public pre-order quote: read-only, tenant-scoped, equal to what create enforces ========'
+SELECT pg_temp.t_state() AS pre_quote \gset
+SELECT * FROM pay_order_quote(:tenant_a, :platform, 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'INR') \gset q_
+SELECT pg_temp.t_assert(:q_o_gross_minor = 58882 AND :q_o_taxable_minor = 49900 AND :q_o_cgst_minor = 4491 AND :q_o_sgst_minor = 4491
+                    AND :'q_o_mode' = 'live' AND :'q_o_orderable' = 't' AND :'q_o_document_type' = 'tax_invoice',
+    'the quote carries the hand-derived breakdown and total');
+SELECT pg_temp.t_assert((:'q_o_lines'::jsonb -> 0 ->> 'line_total_minor')::bigint = 58882 AND jsonb_array_length(:'q_o_lines'::jsonb) = 1, 'and the per-line breakdown');
+SELECT pg_temp.t_assert(pg_temp.t_state() = :'pre_quote' AND (SELECT count(*) = 0 FROM pay_orders WHERE idempotency_key = 'quote-probe'), 'quoting writes nothing and allocates no number');
+SELECT pg_temp.t_assert((SELECT o_amount_minor = :q_o_gross_minor FROM pay_order_create(:tenant_a, :platform, 'quote-probe', 'subscription_period', '9001', NULL,
+    :q_o_gross_minor, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')), 'an order created with the quoted total is accepted');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'quote-probe-2', 'subscription_period', '9001', NULL,
+    %s, 'INR', 'razorpay', 'live', 'ord-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'tester')$f$, :tenant_a, :q_o_gross_minor + 1), 'PY034', 'one paisa off the quote is refused by create');
+SELECT pg_temp.t_assert((SELECT NOT o_orderable FROM pay_order_quote(:tenant_a, :platform, 'ph-inv', pg_temp.spec('Monthly plan', '998314', '499.00'), 'INR')), 'a live series with a placeholder issuer is quotable but not orderable');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_quote(%L, 'otherplatform', 'ord-inv', pg_temp.spec('x', '998314', '1.00'), 'INR')$f$, :tenant_a), 'PY011', 'a series of another platform is refused');
+SELECT _inv_issuer_upsert('ord-tenant-only', :platform, :tenant_a, 'Tenant A Consulting', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester');
+SELECT _inv_series_create('ord-tenant-inv', 'ord-tenant-only', 'invoice', 'live', 'TA', '/', 5, true, 'tester');
+SELECT pg_temp.t_assert((SELECT o_gross_minor > 0 FROM pay_order_quote(:tenant_a, :platform, 'ord-tenant-inv', pg_temp.spec('Work', '998314', '100.00'), 'INR')), 'the owning tenant can quote its own series');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_quote(%L, 'l73platform', 'ord-tenant-inv', pg_temp.spec('Work', '998314', '100.00'), 'INR')$f$, :tenant_b), 'PY011', 'another tenant cannot quote it');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_create(%L, 'l73platform', 'k-xt', 'subscription_period', '9001', NULL, 11800, 'INR', 'razorpay', 'live', 'ord-tenant-inv', pg_temp.spec('Work', '998314', '100.00'), 'tester')$f$, :tenant_b), 'PY011', 'nor create an order in it');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM pay_order_quote(NULL, 'l73platform', 'ord-inv', %L, 'INR')$f$, pg_temp.spec('x', '998314', '1.00')), 'PY030', 'the tenant is required');
+
+\echo 'ALL L7.3 SQL ASSERTIONS PASSED'

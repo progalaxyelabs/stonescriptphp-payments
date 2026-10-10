@@ -1,0 +1,44 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Redact stored raw webhook payloads whose retention period has passed.
+ *
+ *   pay-purge-webhooks --bootstrap=/path/to/retention.php [--actor=cron] [--limit=500]
+ *
+ * The bootstrap file is the application's own: it loads its autoloader and configuration and RETURNS a configured
+ * StoneScriptPay\Http\Webhook\WebhookRetention. The period is pay_config 'raw_payload_retention_months' (default 13;
+ * CA/legal to confirm), changed with a plain UPDATE. Each redaction is audited in pay_webhook_redactions. Invoices,
+ * payments and buyer snapshots are never touched.
+ *
+ * Repeats until a run redacts fewer rows than --limit. Prints the total. Exit status 0 on success, 1 on a usage or
+ * bootstrap error. Suitable for a daily cron / systemd timer.
+ */
+
+use StoneScriptPay\Http\Webhook\WebhookRetention;
+
+$opts = getopt('', ['bootstrap:', 'actor::', 'limit::']);
+if (!isset($opts['bootstrap']) || !is_string($opts['bootstrap']) || !is_file($opts['bootstrap'])) {
+    fwrite(STDERR, "usage: pay-purge-webhooks --bootstrap=/path/to/retention.php [--actor=cron] [--limit=500]\n");
+    exit(1);
+}
+$job = require $opts['bootstrap'];
+if (!$job instanceof WebhookRetention) {
+    fwrite(STDERR, 'the bootstrap file must return a ' . WebhookRetention::class . "\n");
+    exit(1);
+}
+$actor = isset($opts['actor']) && is_string($opts['actor']) && $opts['actor'] !== '' ? $opts['actor'] : 'pay-purge-webhooks';
+$limit = isset($opts['limit']) ? max(1, (int) $opts['limit']) : 500;
+
+$total = 0;
+for ($i = 0; $i < 1000; $i++) {          // bounded: at most 1000 batches per run
+    $n = $job->redactExpired($actor, $limit);
+    $total += $n;
+    if ($n < $limit) {
+        break;
+    }
+}
+echo "redacted {$total} stored webhook payload(s)\n";
+exit(0);

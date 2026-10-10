@@ -47,7 +47,10 @@ DECLARE
     v_has_success BOOLEAN;
     v_reason     TEXT;
     v_payable    BOOLEAN;
-    v_gw         RECORD;
+    -- scalars, not a RECORD: a RECORD that is only assigned on the payable path makes a
+    -- not-payable first call on a fresh session fail with 'record is not assigned yet'
+    v_gw_code    TEXT;
+    v_gw_endpoint TEXT;
 BEGIN
     SELECT * INTO v_inv FROM inv_invoices WHERE id = p_invoice_id;
     IF NOT FOUND THEN
@@ -71,13 +74,13 @@ BEGIN
     END IF;
 
     IF v_payable THEN
-        SELECT g.gateway_code, g.checkout_endpoint INTO v_gw FROM inv_resolve_gateway(p_invoice_id, v_inv.tenant_id, v_inv.platform_code) g;
+        SELECT g.gateway_code, g.checkout_endpoint INTO v_gw_code, v_gw_endpoint FROM inv_resolve_gateway(p_invoice_id, v_inv.tenant_id, v_inv.platform_code) g;
     END IF;
 
     RETURN QUERY SELECT
         p_invoice_id, v_payable, v_inv.status, v_reason,
         v_inv.gross_total_minor, v_inv.currency,
-        (CASE WHEN v_payable THEN v_gw.gateway_code END),
-        (CASE WHEN v_payable THEN v_gw.checkout_endpoint END);
+        (CASE WHEN v_payable THEN v_gw_code END),
+        (CASE WHEN v_payable THEN v_gw_endpoint END);
 END;
 $$ LANGUAGE plpgsql STABLE;

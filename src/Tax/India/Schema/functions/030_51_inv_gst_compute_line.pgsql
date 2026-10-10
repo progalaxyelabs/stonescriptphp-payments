@@ -65,8 +65,12 @@ BEGIN
     ELSIF p_mode = 'export_lut' THEN
         v_cgst := 0; v_sgst := 0; v_igst := 0;
     ELSIF p_mode = 'intrastate' THEN
-        v_half := inv_money_half_up_divide(v_line_gst, 2);  -- 2 = equal CGST/SGST halves
-        v_cgst := v_half; v_sgst := v_half; v_igst := 0;
+        -- The line's TOTAL tax is rounded once; CGST is half of it rounded half-up and SGST is the REMAINDER,
+        -- so the two heads always sum to the rounded total (an odd paisa goes to CGST, never billed twice).
+        -- Rounding the two halves independently would over-bill an odd total by one paisa per line.
+        -- [CA TO CONFIRM: that an unequal CGST/SGST split of one paisa is acceptable on a tax invoice.]
+        v_half := inv_money_half_up_divide(v_line_gst, 2);  -- 2 = CGST share
+        v_cgst := v_half; v_sgst := v_line_gst - v_half; v_igst := 0;
     ELSIF p_mode = 'interstate' THEN
         v_cgst := 0; v_sgst := 0; v_igst := v_line_gst;
     ELSE

@@ -10,6 +10,7 @@ use StoneScriptPay\Contracts\PaymentProvider;
 use StoneScriptPay\DTO\CreateOrderRequest;
 use StoneScriptPay\DTO\CreateSubscriptionRequest;
 use StoneScriptPay\DTO\OrderResult;
+use StoneScriptPay\DTO\PaymentDetails;
 use StoneScriptPay\DTO\RefundRequest;
 use StoneScriptPay\DTO\RefundResult;
 use StoneScriptPay\DTO\SubscriptionResult;
@@ -17,6 +18,7 @@ use StoneScriptPay\DTO\VerificationResult;
 use StoneScriptPay\DTO\VerifyRequest;
 use StoneScriptPay\DTO\WebhookEvent;
 use StoneScriptPay\DTO\WebhookRequest;
+use StoneScriptPay\Exceptions\MalformedWebhookException;
 use StoneScriptPay\Exceptions\PaymentException;
 use StoneScriptPay\Exceptions\SignatureVerificationException;
 use StoneScriptPay\Exceptions\WebhookException;
@@ -56,12 +58,27 @@ final class RazorpayDriver implements PaymentProvider
      *                               the Razorpay API throws PaymentException lazily if empty.
      * @param string $keySecret     Razorpay Key Secret (NEVER send to frontend — server only).
      * @param string $webhookSecret Razorpay Webhook Secret (NEVER send to frontend — server only).
+     * @param ?string $mode         Optional explicit 'live' | 'test'. Needed only for a webhook-only
+     *                               instance built with an empty $keyId; otherwise the mode is read from
+     *                               the key id prefix (rzp_test_ / rzp_live_) and, when both are given,
+     *                               they must agree.
+     * @param ?\Closure $paymentFetcher Optional transport for fetchPayment(): fn(string $paymentId): array
+     *                               returning the Razorpay payment entity as an array. Defaults to the SDK.
+     *                               Exists for tests and custom transports.
+     * @param ?\Closure $orderFinder Optional transport for findOrderByReceipt(): fn(string $receipt): list<array>
+     *                               returning the matching Razorpay order entities. Defaults to the SDK.
      */
     public function __construct(
         private readonly string $keyId,
         private readonly string $keySecret,
         private readonly string $webhookSecret,
+        private readonly ?string $mode = null,
+        private readonly ?\Closure $paymentFetcher = null,
+        private readonly ?\Closure $orderFinder = null,
     ) {
+        if ($mode !== null && !in_array($mode, ['live', 'test'], true)) {
+            throw new PaymentException("Razorpay mode must be 'live' or 'test' (got '{$mode}')");
+        }
     }
 
     /**
@@ -83,6 +100,115 @@ final class RazorpayDriver implements PaymentProvider
         }
 
         return $this->api;
+    }
+
+    // -------------------------------------------------------------------------
+    // Mode, publishable key, payment lookup
+    // -------------------------------------------------------------------------
+
+    /** @inheritdoc */
+    public function mode(): string
+    {
+        $fromKey = null;
+        if (str_starts_with($this->keyId, 'rzp_test_')) {
+            $fromKey = 'test';
+        } elseif (str_starts_with($this->keyId, 'rzp_live_')) {
+            $fromKey = 'live';
+        }
+        if ($fromKey !== null && $this->mode !== null && $this->mode !== $fromKey) {
+            throw new PaymentException("Razorpay mode '{$this->mode}' contradicts the key id ({$fromKey} key)");
+        }
+        $mode = $fromKey ?? $this->mode;
+        if ($mode === null) {
+            throw new PaymentException(
+                'Razorpay mode cannot be determined: the key id is not an rzp_test_/rzp_live_ key and no explicit mode was given'
+            );
+        }
+
+        return $mode;
+    }
+
+    /** @inheritdoc */
+    public function publishableKeyId(): string
+    {
+        return $this->keyId;
+    }
+
+    /**
+     * @inheritdoc
+     *
+     * GET /payments/{id}. Razorpay status 'captured' is the only settled state; 'authorized' is a
+     * hold. amount is in paise.
+     */
+    public function fetchPayment(string $paymentId): PaymentDetails
+    {
+        if (preg_match('/^pay_[A-Za-z0-9]+$/D', $paymentId) !== 1) {
+            // never put an operator- or client-supplied string into an API path unchecked
+            throw new PaymentException('Razorpay fetchPayment: not a Razorpay payment id (expected pay_ followed by letters and digits)');
+        }
+        try {
+            $entity = $this->paymentFetcher !== null
+                ? ($this->paymentFetcher)($paymentId)
+                : $this->toArray($this->getApi()->payment->fetch($paymentId));
+        } catch (PaymentException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new PaymentException('Razorpay payment lookup failed: ' . $e->getMessage(), 0, $e);
+        }
+        if (!is_array($entity) || !isset($entity['id'], $entity['amount'], $entity['currency'])) {
+            throw new PaymentException('Razorpay payment lookup returned an unreadable payment');
+        }
+
+        $status = match ((string) ($entity['status'] ?? '')) {
+            'captured' => 'captured',
+            'authorized' => 'authorized',
+            'failed' => 'failed',
+            'refunded' => 'refunded',
+            'created' => 'created',
+            default => 'unknown',
+        };
+        // a partially refunded captured payment still reports 'captured' with amount_refunded > 0
+        $notes = $entity['notes'] ?? [];
+
+        return new PaymentDetails(
+            paymentId: (string) $entity['id'],
+            status: $status,
+            amountMinorUnits: (int) $entity['amount'],
+            currency: (string) $entity['currency'],
+            gatewayOrderId: isset($entity['order_id']) ? (string) $entity['order_id'] : null,
+            capturedAt: isset($entity['created_at']) && is_numeric($entity['created_at'])
+                ? (new \DateTimeImmutable('@' . (int) $entity['created_at'])) : null,
+            notes: is_array($notes) ? $notes : [],
+            raw: $entity,
+            amountRefundedMinorUnits: isset($entity['amount_refunded']) ? (int) $entity['amount_refunded'] : 0,
+            capturedAtIsEstimate: true,      // Razorpay reports the payment's creation time, not a capture time
+        );
+    }
+
+    /**
+     * @inheritdoc
+     *
+     * GET /orders?receipt=... : an order creation that crashed after the gateway call but before our attach is found
+     * again (our receipt is the order_ref) instead of creating a second gateway order.
+     */
+    public function findOrderByReceipt(string $receipt): ?OrderResult
+    {
+        try {
+            $items = $this->orderFinder !== null
+                ? ($this->orderFinder)($receipt)
+                : ($this->toArray($this->getApi()->order->all(['receipt' => substr($receipt, 0, 40), 'count' => 5]))['items'] ?? []);
+        } catch (PaymentException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new PaymentException('Razorpay order lookup failed: ' . $e->getMessage(), 0, $e);
+        }
+        foreach ($items as $o) {
+            if (is_array($o) && ($o['receipt'] ?? null) === substr($receipt, 0, 40) && isset($o['id'], $o['amount'], $o['currency'])) {
+                return new OrderResult((string) $o['id'], (int) $o['amount'], (string) $o['currency'], $receipt, $this->keyId, (string) ($o['status'] ?? ''), $o);
+            }
+        }
+
+        return null;
     }
 
     // -------------------------------------------------------------------------
@@ -198,32 +324,74 @@ final class RazorpayDriver implements PaymentProvider
             throw new SignatureVerificationException('webhook');
         }
 
-        // Parse payload
-        $payload = json_decode($req->rawBody, true);
-        if (!is_array($payload)) {
-            throw new WebhookException('webhook body is not valid JSON');
+        // Razorpay carries its unique event id in a header (x-razorpay-event-id), so it is
+        // known even when the body turns out to be unreadable.
+        $eventId = null;
+        foreach ($req->headers as $name => $value) {
+            if (strtolower((string) $name) === 'x-razorpay-event-id' && (string) $value !== '') {
+                $eventId = (string) $value;
+                break;
+            }
         }
 
-        $providerEvent = $payload['event'] ?? '';
-        $type = $this->normaliseEventType($providerEvent);
-        $entityPayload = $payload['payload'] ?? [];
+        // Parse payload. The signature has ALREADY verified: anything that goes wrong from here on (not JSON,
+        // or JSON of an unexpected shape that trips normalisation) is an authentic event with a bad envelope,
+        // which the caller must store raw, not drop. Hence the catch-all.
+        try {
+            $payload = json_decode($req->rawBody, true);
+            if (!is_array($payload)) {
+                throw new MalformedWebhookException('webhook body is not valid JSON', $eventId);
+            }
 
-        [$invoiceRef, $gatewayTxnRef, $amountMinorUnits, $currency, $capturedAt, $tenantId, $platformCode] =
-            $this->extractNormalisedFields($type, $entityPayload);
+            $providerEvent = $payload['event'] ?? '';
+            if (!is_string($providerEvent)) {
+                throw new MalformedWebhookException('webhook event name is not a string', $eventId);
+            }
+            $type = $this->normaliseEventType($providerEvent);
+            $entityPayload = $payload['payload'] ?? [];
+            if (!is_array($entityPayload)) {
+                throw new MalformedWebhookException('webhook payload is not an object', $eventId);
+            }
 
-        return new WebhookEvent(
-            type:             $type,
-            providerEvent:    $providerEvent,
-            payload:          $entityPayload,
-            raw:              $payload,
-            invoiceRef:       $invoiceRef,
-            gatewayTxnRef:    $gatewayTxnRef,
-            amountMinorUnits: $amountMinorUnits,
-            currency:         $currency,
-            capturedAt:       $capturedAt,
-            tenantId:         $tenantId,
-            platformCode:     $platformCode,
-        );
+            [$invoiceRef, $gatewayTxnRef, $amountMinorUnits, $currency, $capturedAt, $tenantId, $platformCode] =
+                $this->extractNormalisedFields($type, $entityPayload);
+
+            // Capture time: the gateway's own if it ever sends one; otherwise the EVENT's creation time (the event is
+            // raised when the capture happens); only as a last resort the payment's creation time. Anything but a
+            // reported capture time is flagged as an estimate.
+            $capturedAtIsEstimate = $capturedAt !== null;
+            if ($type === 'payment.captured') {
+                $entity = $entityPayload['payment']['entity'] ?? [];
+                if (is_array($entity) && isset($entity['captured_at']) && is_numeric($entity['captured_at'])) {
+                    $capturedAt = (new \DateTimeImmutable())->setTimestamp((int) $entity['captured_at']);
+                    $capturedAtIsEstimate = false;
+                } elseif (isset($payload['created_at']) && is_numeric($payload['created_at'])) {
+                    $capturedAt = (new \DateTimeImmutable())->setTimestamp((int) $payload['created_at']);
+                }
+            }
+
+            return new WebhookEvent(
+                type:             $type,
+                providerEvent:    $providerEvent,
+                payload:          $entityPayload,
+                raw:              $payload,
+                invoiceRef:       $invoiceRef,
+                gatewayTxnRef:    $gatewayTxnRef,
+                amountMinorUnits: $amountMinorUnits,
+                currency:         $currency,
+                capturedAt:       $capturedAt,
+                tenantId:         $tenantId,
+                platformCode:     $platformCode,
+                eventId:          $eventId,
+                orderRef:         $type === 'payment.captured' && isset($entityPayload['payment']['entity']['notes']['order_id'])
+                                      ? (string) $entityPayload['payment']['entity']['notes']['order_id'] : null,
+                capturedAtIsEstimate: $capturedAtIsEstimate,
+            );
+        } catch (MalformedWebhookException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new MalformedWebhookException('webhook body could not be read: ' . $e::class, $eventId);
+        }
     }
 
     /**
@@ -460,6 +628,12 @@ final class RazorpayDriver implements PaymentProvider
     // -------------------------------------------------------------------------
     // Settlement model
     // -------------------------------------------------------------------------
+
+    /** @inheritdoc */
+    public function webhookSignatureHeader(): string
+    {
+        return 'x-razorpay-signature';
+    }
 
     /**
      * @inheritdoc

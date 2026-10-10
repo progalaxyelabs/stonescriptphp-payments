@@ -1,0 +1,246 @@
+-- stonescriptphp-payments :: TEST - entitlement, comp activation, postpaid cycle, legacy bridge (L7.4). STRICT (sets ON_ERROR_STOP itself).
+-- Concurrency proofs are in tests/shell/l7_4_entitlement.sh.
+--
+-- Hand-derived: postpaid plan Rs 499.00 excl. GST 18% intrastate => taxable 49900, GST 8982, gross 58882.
+\set ON_ERROR_STOP on
+UPDATE inv_gst_config SET config_value = '36500' WHERE config_key IN ('issue_date_window_days_live', 'issue_date_window_days_test');
+-- the clock windows are widened for a test that simulates dates (production keeps them tight; see the clock tests below)
+UPDATE pay_config SET config_value = '4000000000' WHERE config_key = 'pay_clock_skew_seconds';
+UPDATE pay_config SET config_value = '100000000' WHERE config_key = 'ent_late_apply_grace_hours';
+\set platform '''l74platform'''
+\set t_comp '''00000000-0000-0000-0000-0000000d0001'''
+\set t_post '''00000000-0000-0000-0000-0000000d0002'''
+\set t_pre  '''00000000-0000-0000-0000-0000000d0003'''
+\set t_trial '''00000000-0000-0000-0000-0000000d0004'''
+\set t_none '''00000000-0000-0000-0000-0000000d0099'''
+
+CREATE FUNCTION pg_temp.t_assert(p_ok BOOLEAN, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    IF p_ok IS NOT TRUE THEN RAISE EXCEPTION 'ASSERTION FAILED: %', p_label; END IF;
+    RAISE NOTICE 'ok: %', p_label;
+END; $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pg_temp.t_expect(p_sql TEXT, p_state TEXT, p_label TEXT) RETURNS VOID AS $$
+BEGIN
+    BEGIN
+        EXECUTE p_sql;
+    EXCEPTION WHEN OTHERS THEN
+        IF SQLSTATE = p_state THEN RAISE NOTICE 'ok: % (raised %)', p_label, p_state; RETURN; END IF;
+        RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but got % (%)', p_label, p_state, SQLSTATE, SQLERRM;
+    END;
+    RAISE EXCEPTION 'ASSERTION FAILED: % - expected % but nothing was raised', p_label, p_state;
+END; $$ LANGUAGE plpgsql;
+
+-- the billing run, the way the runner does it: one entitlement per call
+CREATE FUNCTION pg_temp.bill(p_as_of TIMESTAMPTZ) RETURNS TABLE (o_entitlement_id BIGINT, o_period_start TIMESTAMPTZ, o_period_end TIMESTAMPTZ, o_invoice_id BIGINT, o_error TEXT) AS $$
+DECLARE v_id BIGINT;
+BEGIN
+    FOR v_id IN SELECT d.o_entitlement_id FROM _ent_billing_due(p_as_of, 100000) d LOOP
+        RETURN QUERY SELECT v_id, r.o_period_start, r.o_period_end, r.o_invoice_id, r.o_error FROM _ent_billing_run_one(v_id, p_as_of, 'billing-run') r;
+    END LOOP;
+END; $$ LANGUAGE plpgsql;
+-- the tick in cursor batches of 3 (so batching is exercised), returning how many it changed
+CREATE FUNCTION pg_temp.tick(p_as_of TIMESTAMPTZ) RETURNS INTEGER AS $$
+DECLARE v RECORD; v_after BIGINT := 0; v_total INTEGER := 0;
+BEGIN
+    LOOP
+        SELECT * INTO v FROM _ent_tick(p_as_of, 3, v_after);
+        EXIT WHEN v.o_examined = 0;
+        v_total := v_total + v.o_changed; v_after := v.o_last_id;
+    END LOOP;
+    RETURN v_total;
+END; $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION pg_temp.money_state() RETURNS TEXT AS $$
+    SELECT (SELECT count(*) FROM inv_invoices)::text || '/' || (SELECT count(*) FROM inv_payments) || '/' || (SELECT count(*) FROM pay_captured_payments)
+        || '/' || (SELECT coalesce(sum(last_number), 0) FROM inv_series_counter);
+$$ LANGUAGE sql;
+
+\echo '======== fixtures ========'
+SELECT _inv_issuer_upsert('ent-issuer', :platform, NULL, 'Ent Seller Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester');
+SELECT _inv_series_create('ent-inv', 'ent-issuer', 'invoice', 'live', 'EN', '/', 5, true, 'tester');
+SELECT _inv_series_create('ent-ord', 'ent-issuer', 'invoice', 'live', 'EO', '/', 5, true, 'tester');
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by) VALUES
+    (9301, 'Postpaid monthly', true, true, false, '2026-01-01', 'seed'),
+    (9302, 'Prepaid monthly', true, true, false, '2026-01-01', 'seed'),
+    (9303, 'Lifetime', false, true, false, '2026-01-01', 'seed');
+INSERT INTO subscription_pricing_plans (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by) VALUES
+    (9301, 9301, 1, 'month', 49900, true, true, true, '2026-01-01', 'seed'),
+    (9302, 9302, 1, 'month', 49900, true, false, true, '2026-01-01', 'seed');
+-- the library allows ONE trial plan in a database: use the existing one if an earlier test created it, else create it
+INSERT INTO pricing_plans (id, name, is_subscription, is_active, is_trial, created_at, created_by)
+SELECT 9304, 'Free trial', true, true, true, '2026-01-01', 'seed' WHERE NOT EXISTS (SELECT 1 FROM pricing_plans WHERE is_trial);
+INSERT INTO subscription_pricing_plans (id, pricing_plan_id, duration, duration_uom, amount, is_amount_tax_exclusive, is_post_paid, is_active, created_at, created_by)
+SELECT 9304, 9304, 7, 'day', 0, true, false, true, '2026-01-01', 'seed' WHERE EXISTS (SELECT 1 FROM pricing_plans WHERE id = 9304);
+UPDATE pricing_plans SET is_active = true WHERE is_trial;
+UPDATE subscription_pricing_plans SET is_active = true WHERE pricing_plan_id IN (SELECT id FROM pricing_plans WHERE is_trial);
+SELECT (spp.duration || ' ' || spp.duration_uom)::interval AS trial_len FROM subscription_pricing_plans spp JOIN pricing_plans pp ON pp.id = spp.pricing_plan_id
+ WHERE pp.is_trial AND spp.is_active ORDER BY spp.id LIMIT 1 \gset
+INSERT INTO one_time_pricing_plans (id, pricing_plan_id, duration, duration_uom, is_life_time, is_credit_system, credit_quantity, amount, is_amount_tax_exclusive, is_active, created_at, created_by)
+VALUES (9303, 9303, NULL, NULL, true, false, NULL, 199900, true, true, '2026-01-01', 'seed');
+
+\echo '======== comp activation: audited, idempotent, no money ========'
+SELECT pg_temp.money_state() AS m0 \gset
+SELECT o_outcome AS c1_outcome, o_activation_id AS c1_act, o_period_end AS c1_end FROM _ent_comp_activate(:t_comp, :platform, 'default', 'comp-pro', 30, 'comp-key-1', 'admin:asha', 'launch partner', '2026-10-01 10:00+05:30') \gset
+SELECT pg_temp.t_assert(:'c1_outcome' = 'applied' AND :'c1_end'::timestamptz = '2026-10-31 10:00+05:30'::timestamptz, 'a comp grants the days from now');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'already_applied' AND o_activation_id = :c1_act AND o_period_end = :'c1_end'::timestamptz
+                           FROM _ent_comp_activate(:t_comp, :platform, 'default', 'comp-pro', 30, 'comp-key-1', 'admin:asha', 'launch partner', '2026-10-02 10:00+05:30')),
+    'the same key and request extends nothing a second time');
+SELECT pg_temp.t_assert((SELECT current_period_end = '2026-10-31 10:00+05:30' FROM ent_entitlements WHERE tenant_id = :t_comp::uuid), 'the period is still extended once');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM ent_activations WHERE tenant_id = :t_comp::uuid AND idempotency_key = 'comp-key-1' AND kind = 'comp' AND actor = 'admin:asha' AND reason = 'launch partner'),
+    'exactly one audit row, with actor and reason');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'comp-enterprise', 30, 'comp-key-1', 'admin:asha', 'x')$f$, :t_comp), 'PY062',
+    'the same key with a different plan is rejected');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'comp-pro', 60, 'comp-key-1', 'admin:asha', 'x')$f$, :t_comp), 'PY062',
+    'the same key with a different duration is rejected');
+SELECT pg_temp.t_assert(pg_temp.money_state() = :'m0', 'a comp created no invoice, no payment, no capture and burned no number');
+SELECT pg_temp.t_assert((SELECT o_period_end = '2026-11-30 10:00+05:30' FROM _ent_comp_activate(:t_comp, :platform, 'default', 'comp-pro', 30, 'comp-key-2', 'admin:asha', 'extension', '2026-10-05 10:00+05:30')),
+    'a second comp (new key) stacks onto the remaining time');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'p', 0, 'k0', 'a', 'r')$f$, :t_comp), 'PY060', 'days must be positive');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'p', 5, 'k0', '', 'r')$f$, :t_comp), 'PY060', 'actor is required');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'p', 5, 'k0', 'a', 'r', NULL)$f$, :t_comp), 'PY060', 'an explicit NULL time is refused, not treated as the default');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'p', 5, '', 'a', 'r')$f$, :t_comp), 'PY060', 'a key is required');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'p', 5, 'k0', 'a', '')$f$, :t_comp), 'PY060', 'a reason is required');
+SELECT pg_temp.t_assert((SELECT count(*) = 2 FROM pay_events WHERE tenant_id = :t_comp::uuid AND event_type = 'entitlement.changed' AND payload->>'kind' = 'comp'), 'each comp appended one entitlement.changed event');
+
+\echo '======== ent_get: the one read, access decisions at a moment ========'
+SELECT pg_temp.t_assert((SELECT o_found AND o_status = 'active' AND NOT o_read_only AND o_error_code IS NULL AND o_plan_ref = 'comp-pro' AND o_source = 'comp' AND o_days_remaining = 41
+                           FROM ent_get(:t_comp::uuid, :platform, 'default', '2026-10-20 10:00+05:30')), 'an active comp reads as active with its days remaining');
+SELECT pg_temp.t_assert((SELECT o_status = 'read_only' AND o_read_only AND o_error_code = 'READ_ONLY_PLAN_ENDED' AND o_reason = 'plan_ended'
+                           FROM ent_get(:t_comp::uuid, :platform, 'default', '2026-12-01 00:00+05:30')), 'after the period it is read-only with the framework error code');
+SELECT pg_temp.t_assert((SELECT o_status = 'none' AND o_read_only AND o_error_code = 'READ_ONLY_NO_SUBSCRIPTION' AND NOT o_found FROM ent_get(:t_none::uuid, :platform)),
+    'a tenant with no row follows the default missing mode: read-only');
+UPDATE pay_config SET config_value = 'allow' WHERE config_key = 'ent_missing_mode';
+SELECT pg_temp.t_assert((SELECT NOT o_read_only AND o_error_code IS NULL AND NOT o_found FROM ent_get(:t_none::uuid, :platform)), 'with missing mode allow the same tenant may write');
+UPDATE pay_config SET config_value = 'read_only' WHERE config_key = 'ent_missing_mode';
+
+\echo '======== free trial ========'
+SELECT o_outcome AS tr_out, o_period_end AS tr_end FROM ent_start_trial(:t_trial, :platform, 'default', '2026-10-01 09:00+05:30', 'trial-1', 'system') \gset
+SELECT pg_temp.t_assert(:'tr_out' = 'applied' AND :'tr_end'::timestamptz = '2026-10-01 09:00+05:30'::timestamptz + :'trial_len'::interval, 'a trial lasts the trial plan duration');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'already_applied' FROM ent_start_trial(:t_trial, :platform, 'default', '2026-10-01 09:00+05:30', 'trial-1', 'system')), 'starting the same trial again is idempotent');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM ent_start_trial(%L, 'l74platform', 'default', '2026-10-02 09:00+05:30', 'trial-2', 'system')$f$, :t_trial), 'PY061', 'a second trial is refused (the tenant already has an entitlement)');
+SELECT pg_temp.t_assert((SELECT o_status = 'trial' AND o_is_trial AND NOT o_read_only FROM ent_get(:t_trial::uuid, :platform, 'default', '2026-10-01 10:00+05:30')), 'a running trial');
+SELECT pg_temp.t_assert((SELECT o_status = 'read_only' AND o_error_code = 'READ_ONLY_TRIAL_EXPIRED' AND o_reason = 'trial_expired' FROM ent_get(:t_trial::uuid, :platform, 'default', :'tr_end'::timestamptz + interval '1 hour')),
+    'an expired trial is read-only with the trial error code');
+
+\echo '======== a capture sets the entitlement: stacking, lifetime, one store ========'
+SELECT _inv_issuer_upsert('ent-issuer', :platform, NULL, 'Ent Seller Pvt Ltd', 'regular', '29AAACX1234C1ZP', '29', 'Bengaluru', false, 'tester');
+CREATE FUNCTION pg_temp.spec(p_desc TEXT, p_price TEXT) RETURNS TEXT AS $$
+    SELECT jsonb_build_object(
+        'buyer', jsonb_build_object('legal_name', 'Buyer One', 'registration_status', 'unregistered', 'address_state', 'Karnataka'),
+        'billing_country_code', 'IN', 'billing_state', 'Karnataka', 'supply_type', 'domestic', 'price_is_inclusive', false, 'round_off', false, 'due_days', 0,
+        'lines', jsonb_build_array(jsonb_build_object('description', p_desc, 'hsn_sac', '998314', 'quantity', '1', 'unit_price', p_price, 'gst_rate', 0.18)))::text;
+$$ LANGUAGE sql;
+SELECT o_order_ref AS o1 FROM pay_order_create(:t_pre, :platform, 'ent-o1', 'subscription_period', '9302', NULL, 58882, 'INR', 'razorpay', 'live', 'ent-ord', pg_temp.spec('Monthly', '499.00'), 'tester') \gset
+SELECT o_outcome AS cap1 FROM pay_apply_capture('razorpay', 'pay_ent1', :'o1', :t_pre, :platform, 58882, 'INR', 'live', '2026-10-01 10:00+05:30', 'test', p_issued_at => '2026-10-01 10:00+05:30') \gset
+SELECT pg_temp.t_assert(:'cap1' = 'applied' AND (SELECT current_period_end = '2026-11-01 10:00+05:30' AND status = 'active' AND source = 'payment' AND plan_ref = 'sub:9302'
+                                                  FROM ent_entitlements WHERE tenant_id = :t_pre::uuid), 'a paid period sets the entitlement');
+SELECT o_order_ref AS o2 FROM pay_order_create(:t_pre, :platform, 'ent-o2', 'subscription_period', '9302', NULL, 58882, 'INR', 'razorpay', 'live', 'ent-ord', pg_temp.spec('Monthly', '499.00'), 'tester') \gset
+SELECT o_outcome AS cap2 FROM pay_apply_capture('razorpay', 'pay_ent2', :'o2', :t_pre, :platform, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30') \gset
+SELECT pg_temp.t_assert((SELECT current_period_end = '2026-12-01 10:00+05:30' FROM ent_entitlements WHERE tenant_id = :t_pre::uuid), 'a plan renewed before expiry STACKS the remaining time (to 1 Dec, not 10 Nov)');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'already_applied' FROM pay_apply_capture('razorpay', 'pay_ent2', :'o2', :t_pre, :platform, 58882, 'INR', 'live', '2026-10-10 10:00+05:30', 'test', p_issued_at => '2026-10-10 10:00+05:30'))
+                    AND (SELECT current_period_end = '2026-12-01 10:00+05:30' FROM ent_entitlements WHERE tenant_id = :t_pre::uuid), 'a redelivered capture extends nothing');
+SELECT pg_temp.t_assert((SELECT count(*) = 2 AND count(DISTINCT invoice_id) = 2 FROM ent_activations WHERE tenant_id = :t_pre::uuid AND kind = 'payment' AND payment_id IS NOT NULL),
+    'each payment is audited with its invoice and payment');
+SELECT pg_temp.t_assert((SELECT count(*) = 2 FROM pay_events WHERE tenant_id = :t_pre::uuid AND event_type = 'entitlement.changed'), 'one entitlement.changed per payment (no duplicate from the store)');
+SELECT o_order_ref AS o3 FROM pay_order_create(:t_pre, :platform, 'ent-o3', 'one_time_license', '9303', NULL, 235882, 'INR', 'razorpay', 'live', 'ent-ord', pg_temp.spec('Lifetime', '1999.00'), 'tester') \gset
+SELECT o_outcome AS cap3 FROM pay_apply_capture('razorpay', 'pay_ent3', :'o3', :t_pre, :platform, 235882, 'INR', 'live', '2026-10-12 10:00+05:30', 'test', p_issued_at => '2026-10-12 10:00+05:30') \gset
+SELECT pg_temp.t_assert((SELECT current_period_end IS NULL AND plan_ref = 'otl:9303' AND status = 'active' FROM ent_entitlements WHERE tenant_id = :t_pre::uuid)
+                    AND (SELECT o_status = 'active' AND o_days_remaining IS NULL AND NOT o_read_only FROM ent_get(:t_pre::uuid, :platform, 'default', '2040-01-01 00:00+05:30')),
+    'a lifetime licence has no end');
+
+\echo '======== postpaid cycle: monthly invoice in arrears, 30 days to read-only, payment restores ========'
+SELECT o_outcome AS en_out FROM _ent_enroll_postpaid(:t_post, :platform, 'default', 9301,
+    jsonb_build_object('series_code', 'ent-inv', 'mode', 'live', 'billing_country_code', 'IN', 'billing_state', 'Karnataka', 'hsn_sac', '998314', 'gst_rate', 0.18,
+                       'buyer', jsonb_build_object('legal_name', 'Post Buyer', 'registration_status', 'unregistered', 'address_state', 'Karnataka')),
+    '2026-01-01 00:00+05:30', 'enroll-1', 'admin:asha') \gset
+SELECT pg_temp.t_assert(:'en_out' = 'applied' AND (SELECT billing_mode = 'postpaid' AND next_billing_at = '2026-02-01 00:00+05:30' AND status = 'active' FROM ent_entitlements WHERE tenant_id = :t_post::uuid), 'enrolled; first invoice falls due after one period');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'already_applied' FROM _ent_enroll_postpaid(:t_post, :platform, 'default', 9301,
+    jsonb_build_object('series_code', 'ent-inv', 'mode', 'live', 'billing_country_code', 'IN', 'billing_state', 'Karnataka', 'hsn_sac', '998314', 'gst_rate', 0.18,
+                       'buyer', jsonb_build_object('legal_name', 'Post Buyer', 'registration_status', 'unregistered', 'address_state', 'Karnataka')),
+    '2026-01-01 00:00+05:30', 'enroll-1', 'admin:asha')), 'enrolment is idempotent');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pg_temp.bill('2026-01-20 00:00+05:30')), 'nothing is billed before the period ends');
+SELECT pg_temp.t_assert((SELECT o_status = 'active' FROM ent_get(:t_post::uuid, :platform, 'default', '2026-01-20 00:00+05:30')), 'access continues during the period');
+SELECT o_invoice_id AS pi1, o_period_start AS p1s, o_period_end AS p1e FROM pg_temp.bill('2026-02-01 00:00+05:30') WHERE o_entitlement_id = (SELECT id FROM ent_entitlements WHERE tenant_id = :t_post::uuid) \gset
+SELECT pg_temp.t_assert((SELECT invoice_number = 'EN/25-26/00001' AND status = 'due' AND gross_total_minor = 58882 AND taxable_value_minor = 49900 AND cgst_minor = 4491 AND sgst_minor = 4491
+                                AND mode = 'live' AND charge_source = 'postpaid_cycle' AND period_start = '2026-01-01 00:00+05:30' AND period_end = '2026-02-01 00:00+05:30'
+                           FROM inv_invoices WHERE id = :pi1), 'January was invoiced in arrears: gapless number, due, hand-derived tax');
+SELECT pg_temp.t_assert((SELECT count(*) = 0 FROM pg_temp.bill('2026-02-01 00:00+05:30')), 'running the billing again bills nothing twice');
+SELECT pg_temp.t_assert((SELECT o_status = 'active' FROM ent_get(:t_post::uuid, :platform, 'default', '2026-02-01 00:00+05:30')), 'on the due date it is not yet overdue');
+SELECT pg_temp.t_assert((SELECT o_status = 'past_due' AND NOT o_read_only AND o_error_code IS NULL AND o_overdue_since = '2026-02-01 00:00+05:30' FROM ent_get(:t_post::uuid, :platform, 'default', '2026-02-02 00:00+05:30')),
+    'the day after, it is past_due: writes still allowed');
+SELECT pg_temp.t_assert((SELECT o_status = 'past_due' AND NOT o_read_only FROM ent_get(:t_post::uuid, :platform, 'default', '2026-03-02 23:59+05:30')), 'day 29 is still past_due');
+SELECT pg_temp.t_assert((SELECT o_status = 'read_only' AND o_read_only AND o_error_code = 'READ_ONLY_PAYMENT_OVERDUE' AND o_reason = 'payment_overdue' FROM ent_get(:t_post::uuid, :platform, 'default', '2026-03-03 00:00+05:30')),
+    'day 30 unpaid: read_only with its own error code');
+SELECT pg_temp.tick('2026-03-03 00:00+05:30') AS ticked \gset
+SELECT pg_temp.t_assert((SELECT status = 'read_only' FROM ent_entitlements WHERE tenant_id = :t_post::uuid) AND :ticked >= 1, 'the tick persists the transition');
+SELECT pg_temp.t_assert(pg_temp.tick('2026-03-03 00:00+05:30') = 0, 'a second tick changes nothing');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_events WHERE tenant_id = :t_post::uuid AND payload->>'kind' = 'tick' AND payload->>'status' = 'read_only'), 'and appended one entitlement.changed event');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_comp_activate(%L, 'l74platform', 'default', 'p', 5, 'kpost', 'a', 'r')$f$, :t_post), 'PY061', 'a postpaid entitlement cannot be comped a period');
+-- payment restores access in the payment's own transaction
+BEGIN;
+SELECT inv_record_payment(:pi1, :t_post::uuid, :platform, 'razorpay', 'pay_post1', 58882, 'INR', 'success', '2026-03-03 09:00+05:30', 'test');
+SELECT pg_temp.t_assert((SELECT status = 'active' FROM ent_entitlements WHERE tenant_id = :t_post::uuid), 'paying the invoice restored the stored status inside the same transaction');
+COMMIT;
+SELECT pg_temp.t_assert((SELECT o_status = 'active' AND NOT o_read_only AND o_overdue_since IS NULL FROM ent_get(:t_post::uuid, :platform, 'default', '2026-03-03 10:00+05:30')), 'access is back');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 FROM pay_events WHERE tenant_id = :t_post::uuid AND payload->>'kind' = 'payment_restored'), 'with a payment_restored event');
+-- the next month bills as invoice 2; an old unpaid invoice keeps the entitlement read-only even when a newer one is paid
+SELECT o_invoice_id AS pi2 FROM pg_temp.bill('2026-03-01 00:00+05:30') WHERE o_entitlement_id = (SELECT id FROM ent_entitlements WHERE tenant_id = :t_post::uuid) \gset
+SELECT pg_temp.t_assert((SELECT invoice_number = 'EN/25-26/00002' AND period_start = '2026-02-01 00:00+05:30' FROM inv_invoices WHERE id = :pi2), 'February is invoice 2: consecutive numbers, chained periods');
+SELECT pg_temp.t_assert((SELECT o_status = 'read_only' AND o_read_only FROM ent_get(:t_post::uuid, :platform, 'default', '2026-04-05 00:00+05:30')), 'an unpaid invoice 30+ days overdue makes it read-only again');
+SELECT inv_record_payment(:pi2, :t_post::uuid, :platform, 'razorpay', 'pay_post2', 58882, 'INR', 'success', '2026-04-05 09:00+05:30', 'test');
+SELECT pg_temp.t_assert((SELECT o_status = 'active' FROM ent_get(:t_post::uuid, :platform, 'default', '2026-04-05 10:00+05:30')), 'paying it restores access again');
+-- catch-up: several periods behind are billed in order, bounded
+SELECT pg_temp.t_assert((SELECT count(*) = 2 AND min(o_period_start) = '2026-03-01 00:00+05:30' FROM pg_temp.bill('2026-05-01 00:00+05:30') WHERE o_error IS NULL), 'a tenant two periods behind is caught up, oldest first');
+SELECT pg_temp.t_assert((SELECT array_agg(invoice_number ORDER BY invoice_number) = ARRAY['EN/25-26/00001','EN/25-26/00002','EN/26-27/00001','EN/26-27/00002']
+                           FROM inv_invoices WHERE tenant_id = :t_post::uuid), 'numbers are consecutive within each financial year (1,2 in 25-26, then 1,2 in 26-27 after 1 April): no gap, no duplicate');
+
+\echo '======== suspend / reinstate ========'
+SELECT pg_temp.t_assert((SELECT o_outcome = 'applied' FROM _ent_set_status(:t_pre, :platform, 'default', 'suspended', 'susp-1', 'admin:asha', 'chargeback review', '2026-10-15 00:00+05:30')), 'an operator suspends');
+SELECT pg_temp.t_assert((SELECT o_status = 'suspended' AND o_read_only FROM ent_get(:t_pre::uuid, :platform, 'default', '2026-10-15 01:00+05:30')), 'a suspended entitlement is never active');
+SELECT pg_temp.t_assert((SELECT o_outcome = 'already_applied' FROM _ent_set_status(:t_pre, :platform, 'default', 'suspended', 'susp-1', 'admin:asha', 'chargeback review', '2026-10-15 00:00+05:30')), 'idempotent per key');
+SELECT pg_temp.t_expect(format($f$SELECT * FROM _ent_set_status(%L, 'l74platform', 'default', 'ended', 'susp-1', 'admin:asha', 'x')$f$, :t_pre), 'PY062', 'the same key for a different status is refused');
+SELECT * FROM _ent_set_status(:t_pre, :platform, 'default', 'active', 'reinst-1', 'admin:asha', 'cleared', '2026-10-16 00:00+05:30');
+SELECT pg_temp.t_assert((SELECT o_status = 'active' FROM ent_get(:t_pre::uuid, :platform, 'default', '2026-10-16 01:00+05:30')), 'reinstated');
+
+\echo '======== legacy bridge: one store, zero diffs ========'
+CREATE TABLE legacy_subscriptions (
+    id SERIAL PRIMARY KEY, platform_code VARCHAR(50) NOT NULL, tenant_id TEXT NOT NULL, owner_email VARCHAR(255), plan_code VARCHAR(50) NOT NULL DEFAULT 'trial',
+    status VARCHAR(50) NOT NULL DEFAULT 'trial', started_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL, cancelled_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE (platform_code, tenant_id));
+INSERT INTO legacy_subscriptions (platform_code, tenant_id, plan_code, status, started_at, expires_at) VALUES
+    ('l74legacy', '00000000-0000-0000-0000-00000000e001', 'trial',  'trial',     '2026-10-05', '2026-10-12'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e002', 'trial',  'trial',     '2026-09-01', '2026-09-08'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e003', 'annual', 'active',    '2026-01-01', '2027-01-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e004', 'annual', 'active',    '2025-01-01', '2026-01-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e005', 'annual', 'suspended', '2026-01-01', '2027-01-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e006', 'annual', 'cancelled', '2026-01-01', '2026-12-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e007', 'annual', 'cancelled', '2025-01-01', '2026-02-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e008', 'annual', 'refunded',  '2026-01-01', '2027-01-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e009', 'annual', 'chargeback','2026-01-01', '2027-01-01'),
+    ('l74legacy', '00000000-0000-0000-0000-00000000e00a', 'life',   'active',    '2026-01-01', 'infinity'),
+    ('l74legacy', 'not-a-uuid', 'annual', 'active', '2026-01-01', '2027-01-01');
+SELECT * FROM _ent_import_legacy('legacy_subscriptions', 'migration-script', '2026-10-10 00:00+05:30') \gset imp_
+SELECT pg_temp.t_assert(:imp_o_imported = 10 AND :imp_o_already = 0 AND :imp_o_invalid = 1, 'ten rows imported, the non-UUID tenant counted invalid and skipped');
+SELECT pg_temp.t_assert((SELECT o_imported = 0 AND o_already = 10 AND o_invalid = 1 FROM _ent_import_legacy('legacy_subscriptions', 'migration-script', '2026-10-10 00:00+05:30')), 'the import is idempotent');
+SELECT pg_temp.t_assert((SELECT count(*) = 1 AND max(o_note) = 'tenant id is not a uuid' FROM _ent_verify_legacy('legacy_subscriptions', '2026-10-10 12:00+05:30')),
+    'ZERO access differences for every importable row (only the invalid tenant is reported)');
+SELECT pg_temp.t_assert((SELECT count(*) = 10 FROM ent_activations WHERE kind = 'migration' AND idempotency_key LIKE 'legacy:l74legacy:%'), 'every import is audited');
+SELECT pg_temp.t_assert((SELECT bool_and((l.expires_at > '2026-10-10 12:00+05:30' AND l.status NOT IN ('suspended','refunded','chargeback')) =
+                                          (v.expires_at > '2026-10-10 12:00+05:30' AND v.status NOT IN ('suspended','refunded','chargeback')))
+                           FROM legacy_subscriptions l JOIN ent_legacy_subscriptions v ON v.tenant_id = l.tenant_id AND v.platform_code = l.platform_code),
+    'the compatibility view gives every legacy reader the same active/inactive answer');
+UPDATE legacy_subscriptions SET expires_at = '2027-01-01' WHERE tenant_id = '00000000-0000-0000-0000-00000000e004';
+SELECT pg_temp.t_assert((SELECT count(*) = 2 AND bool_or(o_note = 'access decision differs' AND o_tenant_id LIKE '%e004') FROM _ent_verify_legacy('legacy_subscriptions', '2026-10-10 12:00+05:30')),
+    'the verifier does catch a real difference');
+
+\echo '======== guards ========'
+SELECT pg_temp.t_expect(format($f$UPDATE ent_entitlements SET tenant_id = %L WHERE tenant_id = %L$f$, :t_none, :t_comp), 'PY063', 'an entitlement never changes tenant');
+SELECT pg_temp.t_expect(format($f$DELETE FROM ent_entitlements WHERE tenant_id = %L$f$, :t_comp), 'PY063', 'entitlements are never deleted');
+SELECT pg_temp.t_expect($$UPDATE ent_activations SET actor = 'x'$$, 'PY063', 'activations are append-only (update)');
+SELECT pg_temp.t_expect($$DELETE FROM ent_activations$$, 'PY063', 'activations are append-only (delete)');
+SELECT pg_temp.t_expect($$UPDATE ent_billing_runs SET invoice_id = 0$$, 'PY063', 'billing runs are append-only');
+SELECT pg_temp.t_expect('TRUNCATE ent_entitlements CASCADE', 'PY019', 'entitlements cannot be truncated');
+SELECT pg_temp.t_expect('TRUNCATE ent_activations', 'PY019', 'activations cannot be truncated');
+
+\echo 'ALL L7.4 SQL ASSERTIONS PASSED'

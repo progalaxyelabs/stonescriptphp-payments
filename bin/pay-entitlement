@@ -1,0 +1,125 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Operator and scheduler tool for the entitlement store. Run on the server with the platform's DIRECT database credentials (the bootstrap file),
+ * never through the gateway's /call (the functions it drives are internal and /call refuses them).
+ *
+ *   pay-entitlement <command> --bootstrap=FILE [options]
+ *
+ *   comp            --tenant --platform --plan-ref --days --key --actor --reason [--product]    complimentary activation (no money)
+ *   status          --tenant --platform --status=suspended|ended|active --key --actor --reason [--product]
+ *   enroll-postpaid --tenant --platform --plan=ID --profile=JSON|@FILE --anchor=ISO --key --actor [--product]
+ *   billing-mode    --tenant --platform --mode=prepaid|postpaid --key --actor --reason [--plan --profile --anchor --period-end --product]
+ *   missing-mode    --platform --mode=read_only|allow --actor
+ *   import-legacy   --legacy=TABLE --actor [--sync]       copy a legacy subscriptions table; --sync is the final delta import
+ *   cutover-check   --legacy=TABLE --platform --legacy-missing-mode=read_only|allow   exits 1 unless the cutover gate passes
+ *   billing-run     [--limit=100] [--as-of=ISO]           invoice due postpaid periods (cron; as-of only for rehearsals)
+ *   tick            [--batch=500] [--as-of=ISO]           persist stale statuses (cron)
+ *
+ * Every mutating command REQUIRES --actor (written to the audit trail and logged to stderr). The bootstrap file RETURNS a configured
+ * StoneScriptPay\Http\Entitlement\EntitlementOperations. Exit status 0 on success, 1 on a usage error or a refused action.
+ */
+
+use StoneScriptPay\Http\Entitlement\EntitlementOperations;
+
+$argvCmd = $argv[1] ?? '';
+// PHP's getopt() stops at the first non-option argument, which here is the command, so the options after the command are parsed by hand:
+// --name=value, or a bare --flag (true). Anything else is a usage error.
+$parseArgs = static function (array $args): array {
+    $o = [];
+    foreach ($args as $a) {
+        if (preg_match('/^--([a-z][a-z0-9-]*)(?:=(.*))?$/s', (string) $a, $m) !== 1) {
+            fwrite(STDERR, "unexpected argument \"$a\": options are --name=value or --flag
+");
+            exit(1);
+        }
+        $o[$m[1]] = array_key_exists(2, $m) ? $m[2] : true;
+    }
+
+    return $o;
+};
+$o = $parseArgs(array_slice($argv, 2));
+$usage = static function (string $why): never {
+    fwrite(STDERR, "pay-entitlement: $why\nsee the header of bin/pay-entitlement for the commands and options\n");
+    exit(1);
+};
+$need = static function (array $names) use ($o, $usage): void {
+    foreach ($names as $n) {
+        if (!isset($o[$n]) || !is_string($o[$n]) || trim($o[$n]) === '') {
+            $usage("missing --$n");
+        }
+    }
+};
+$need(['bootstrap']);
+if (!is_file($o['bootstrap'])) {
+    $usage('bootstrap file not found');
+}
+$ops = require $o['bootstrap'];
+if (!$ops instanceof EntitlementOperations) {
+    $usage('the bootstrap file must return a ' . EntitlementOperations::class);
+}
+$product = isset($o['product']) && is_string($o['product']) && $o['product'] !== '' ? $o['product'] : 'default';
+$profile = static function () use ($o, $usage): ?array {
+    if (!isset($o['profile'])) {
+        return null;
+    }
+    $raw = str_starts_with((string) $o['profile'], '@') ? (string) @file_get_contents(substr((string) $o['profile'], 1)) : (string) $o['profile'];
+    $d = json_decode($raw, true);
+    if (!is_array($d)) {
+        $usage('--profile must be JSON (or @file)');
+    }
+
+    return $d;
+};
+
+try {
+    switch ($argvCmd) {
+        case 'comp':
+            $need(['tenant', 'platform', 'plan-ref', 'days', 'key', 'actor', 'reason']);
+            $r = $ops->comp($o['tenant'], $o['platform'], $product, $o['plan-ref'], (int) $o['days'], $o['key'], $o['actor'], $o['reason']);
+            break;
+        case 'status':
+            $need(['tenant', 'platform', 'status', 'key', 'actor', 'reason']);
+            $r = $ops->setStatus($o['tenant'], $o['platform'], $product, $o['status'], $o['key'], $o['actor'], $o['reason']);
+            break;
+        case 'enroll-postpaid':
+            $need(['tenant', 'platform', 'plan', 'profile', 'anchor', 'key', 'actor']);
+            $r = $ops->enrollPostpaid($o['tenant'], $o['platform'], $product, (int) $o['plan'], $profile() ?? [], $o['anchor'], $o['key'], $o['actor']);
+            break;
+        case 'billing-mode':
+            $need(['tenant', 'platform', 'mode', 'key', 'actor', 'reason']);
+            $r = $ops->setBillingMode($o['tenant'], $o['platform'], $product, $o['mode'], isset($o['plan']) ? (int) $o['plan'] : null, $profile(),
+                $o['anchor'] ?? null, $o['period-end'] ?? null, $o['key'], $o['actor'], $o['reason']);
+            break;
+        case 'missing-mode':
+            $need(['platform', 'mode', 'actor']);
+            $r = ['mode' => $ops->setMissingMode($o['platform'], $o['mode'], $o['actor'])];
+            break;
+        case 'import-legacy':
+            $need(['legacy', 'actor']);
+            $r = $ops->importLegacy($o['legacy'], $o['actor'], isset($o['sync']));
+            break;
+        case 'cutover-check':
+            $need(['legacy', 'platform', 'legacy-missing-mode']);
+            $r = ['result' => $ops->cutoverCheck($o['legacy'], $o['platform'], $o['legacy-missing-mode'])];
+            break;
+        case 'billing-run':
+            $r = $ops->billingRun($o['as-of'] ?? null, isset($o['limit']) ? max(1, (int) $o['limit']) : 100);
+            break;
+        case 'tick':
+            $r = $ops->tick($o['as-of'] ?? null, isset($o['batch']) ? max(1, (int) $o['batch']) : 500);
+            break;
+        default:
+            $usage('unknown command "' . $argvCmd . '"');
+    }
+} catch (\InvalidArgumentException $e) {
+    $usage($e->getMessage());
+} catch (\Throwable $e) {
+    fwrite(STDERR, 'pay-entitlement: refused: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+echo json_encode($r, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n";
+exit(isset($r['failed']) && $r['failed'] > 0 ? 2 : 0);

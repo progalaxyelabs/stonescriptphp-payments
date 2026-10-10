@@ -1,0 +1,47 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Re-drive webhook inbox rows that did not reach a final outcome.
+ *
+ *   pay-replay-webhooks --bootstrap=/path/to/replayer.php [--limit=50] [--stale=300]
+ *
+ * The bootstrap file is the application's own: it loads its autoloader and configuration and
+ * RETURNS a configured StoneScriptPay\Http\Webhook\WebhookReplayer (store, processor, alert sink).
+ * Keeping that wiring in the application means this script needs no framework and no guessing
+ * about where the database lives.
+ *
+ * Prints one line per row ("<inbox id> <status>") and a summary. Exit status: 0 when every row
+ * reached a final status (or there was nothing to do), 2 when any row is still open (failed,
+ * unattributed, or skipped), 1 for a usage or bootstrap error. Suitable for cron/systemd.
+ */
+
+use StoneScriptPay\Http\Webhook\WebhookReplayer;
+
+$opts = getopt('', ['bootstrap:', 'limit::', 'stale::']);
+if (!isset($opts['bootstrap']) || !is_string($opts['bootstrap']) || !is_file($opts['bootstrap'])) {
+    fwrite(STDERR, "usage: pay-replay-webhooks --bootstrap=/path/to/replayer.php [--limit=50] [--stale=300]\n");
+    exit(1);
+}
+
+$replayer = require $opts['bootstrap'];
+if (!$replayer instanceof WebhookReplayer) {
+    fwrite(STDERR, "the bootstrap file must return a " . WebhookReplayer::class . "\n");
+    exit(1);
+}
+
+$limit = isset($opts['limit']) ? max(1, (int) $opts['limit']) : 50;
+$stale = isset($opts['stale']) ? max(0, (int) $opts['stale']) : 300;
+
+$results = $replayer->replay($limit, $stale);
+$open = 0;
+foreach ($results as $id => $status) {
+    echo $id, ' ', $status, "\n";
+    if (in_array($status, ['failed', 'unattributed', 'skipped', 'received'], true)) {
+        $open++;
+    }
+}
+echo 'replayed ', count($results), ' row(s); ', $open, " still open\n";
+exit($open > 0 ? 2 : 0);
